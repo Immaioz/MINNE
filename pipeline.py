@@ -4,13 +4,19 @@ Usa opencode per orchestrare agenti ricercatori e analisti in parallelo.
 
 Flusso:
   OrchestratorAgent
-    ├── ResearchAgent(topic_1) ──► SummaryAgent(topic_1)
-    ├── ResearchAgent(topic_2) ──► SummaryAgent(topic_2)  (asyncio.gather)
-    └── ResearchAgent(topic_N) ──► SummaryAgent(topic_N)
+    └── JournalAssignerAgent  (assegna journal Q1 a ogni sottotema)
+          ├── ResearchAgent(topic_1, journal_A) ──► CitationVerifier(L1+L2) ──► SummaryAgent(topic_1)
+          ├── ResearchAgent(topic_2, journal_B) ──► CitationVerifier(L1+L2) ──► SummaryAgent(topic_2)
+          └── ResearchAgent(topic_N, journal_N) ──► CitationVerifier(L1+L2) ──► SummaryAgent(topic_N)
   AggregatorAgent  →  tabella Markdown
   RelatedWorksDraftAgent  →  bozza narrativa con citazioni [N]
   NoveltyProposalAgent  →  tabella novità con difficoltà
   BibliographyAgent  →  bibliografia IEEE
+
+Verifica citazioni:
+  L1 — arXiv API: query per titolo, verifica esistenza paper
+  L2 — DOI resolution: risolve DOI via Crossref API, confronta titolo
+  Se un paper non supera entrambi i livelli, il ResearchAgent cerca un sostituto.
 """
 
 import argparse
@@ -19,8 +25,11 @@ import os
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
+
+import httpx
 
 # Carica .env se presente (per OPENCODE_API_KEY e altre variabili)
 try:
@@ -111,23 +120,53 @@ class OrchestratorAgent(Agent):
 
 
 # ---------------------------------------------------------------------------
+# Agente 1b — JournalAssignerAgent
+#   Assegna un journal Q1 diverso a ciascun sottotema
+# ---------------------------------------------------------------------------
+
+JOURNAL_ASSIGNER_PROMPT = """\
+You are a research journal assigner. Given a list of research subtopics, assign
+to each one a different high-quality Q1 journal according to Scimago Journal
+Rankings (SJR) or JCR that is highly relevant to that subtopic.
+
+Rules:
+- Each subtopic must get a DIFFERENT journal.
+- All journals must be Q1.
+- Assign journals that publish research closely related to the subtopic.
+- Reply with ONLY the mapping — one line per subtopic, no extra commentary.
+
+Format:
+1. <subtopic> → <Journal Name>
+2. <subtopic> → <Journal Name>
+...
+"""
+
+class JournalAssignerAgent(Agent):
+    name = "JournalAssignerAgent"
+    system_prompt = JOURNAL_ASSIGNER_PROMPT
+    opencode_agent = "journal-assigner"
+
+
+# ---------------------------------------------------------------------------
 # Agente 2 — ResearchAgent
-#   Trova 3 articoli recenti da journal Q1 diversi (knowledge interna, no tool)
+#   Trova N articoli recenti da uno specifico journal Q1
 # ---------------------------------------------------------------------------
 
 RESEARCH_PROMPT = """\
 You are an expert scientific literature researcher with deep knowledge of academic
 journals and bibliometric rankings.
 
-Task: given a research subtopic, identify exactly {num_articles} recent peer-reviewed
-articles (published in the last 3 years) from HIGH-QUALITY journals that are ranked Q1
-according to Scimago Journal Rankings (SJR) or JCR.
+Task: given a research subtopic and a TARGET journal, identify exactly
+{num_articles} recent peer-reviewed articles (published in the last 3 years)
+published SPECIFICALLY in that target journal.
 
 Rules:
-- Each article must come from a DIFFERENT journal.
-- All journals must be at least Q1.
+- ALL articles MUST be from the specified target journal.
+- The target journal is Q1 — confirm the quartile in the output.
+- ALL articles MUST have a valid DOI.
+- ALL articles MUST be available on arXiv as preprints (they were posted on arXiv
+  before or after journal publication).
 - Provide REAL articles you are confident about (title, authors, year, journal, DOI).
-- If you are uncertain about the DOI, write "DOI not confirmed".
 - Do NOT invent articles or fabricate titles.
 - Reply ONLY with the structured list below — no preamble, no commentary.
 
@@ -138,7 +177,8 @@ Format (repeat exactly for each article):
 - Authors: <last name, initials; ...>
 - Year: <YYYY>
 - Journal: <journal name> (Q1, IF ≈ <impact factor>)
-- DOI: <doi or "DOI not confirmed">
+- DOI: <doi>
+- arXiv: <arXiv ID, e.g. 2301.12345>
 - Abstract: <2–3 sentences on key contribution and findings>
 
 ### Article 2
@@ -153,8 +193,9 @@ class ResearchAgent(Agent):
     system_prompt = RESEARCH_PROMPT
     opencode_agent = "researcher"
 
-    def __init__(self, num_articles: int = 3):
+    def __init__(self, num_articles: int = 3, target_journal: str = ""):
         self.num_articles = num_articles
+        self.target_journal = target_journal
 
     async def a_run(self, prompt: str, **kwargs) -> str:
         client = OpencodeClient(self.opencode_agent)
@@ -319,12 +360,163 @@ class NoveltyProposalAgent(Agent):
 
 
 # ---------------------------------------------------------------------------
-# Pipeline per singolo sottotema: ResearchAgent → SummaryAgent
+# Citation Verification Layer
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Article:
+    title: str
+    doi: str
+    arxiv_id: str
+    raw: str
+
+    @property
+    def has_doi(self) -> bool:
+        d = self.doi.lower().strip()
+        return d not in ("", "doi not confirmed", "not available", "none", "n/a")
+
+
+def parse_articles(raw_text: str) -> list[Article]:
+    """Estrae articoli dal formato `### Article N` usato da ResearchAgent."""
+    articles: list[Article] = []
+    blocks = re.split(r"### Article \d+", raw_text)
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        t = re.search(r"- Title:\s*(.+)", block)
+        d = re.search(r"- DOI:\s*(.+)", block)
+        a = re.search(r"- arXiv:\s*(\S+)", block)
+        title = t.group(1).strip() if t else ""
+        doi = d.group(1).strip() if d else ""
+        arxiv_id = a.group(1).strip() if a else ""
+        if title:
+            articles.append(Article(title=title, doi=doi, arxiv_id=arxiv_id, raw=block))
+    return articles
+
+
+class CitationVerifier:
+    """L1 (arXiv API) + L2 (DOI resolution via Crossref) verification."""
+
+    ARXIV_URL = "http://export.arxiv.org/api/query"
+    CROSSREF_URL = "https://api.crossref.org/works"
+
+    def __init__(self) -> None:
+        self._client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    # ── L1: arXiv API ────────────────────────────────────────────
+    async def verify_arxiv(self, title: str) -> tuple[bool, str]:
+        """Cerca il titolo su arXiv. Restituisce (passato, messaggio)."""
+        query = quote(title)
+        url = f"{self.ARXIV_URL}?search_query=ti:{query}&max_results=3"
+        try:
+            resp = await self._client.get(url)
+            if resp.status_code != 200:
+                return False, f"arXiv API error {resp.status_code}"
+
+            import xml.etree.ElementTree as ET
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+            root = ET.fromstring(resp.text)
+            entries = root.findall("atom:entry", ns)
+            if not entries:
+                return False, "Nessun risultato su arXiv"
+
+            import difflib
+            for entry in entries:
+                etitle_el = entry.find("atom:title", ns)
+                if etitle_el is not None and etitle_el.text:
+                    etitle = etitle_el.text.strip().lower()
+                    score = difflib.SequenceMatcher(
+                        None, title.lower(), etitle,
+                    ).ratio()
+                    if score > 0.6:
+                        return True, f"arXiv match (score={score:.2f})"
+            return False, "Titolo non corrisponde su arXiv (arXiv titles differ)"
+        except Exception as e:
+            return False, f"arXiv error: {e}"
+
+    # ── L1b: arXiv ID lookup ─────────────────────────────────────
+    async def verify_arxiv_id(self, arxiv_id: str) -> tuple[bool, str]:
+        """Verifica che un arXiv ID esista."""
+        if not arxiv_id:
+            return False, "arXiv ID mancante"
+        url = f"https://export.arxiv.org/api/query?id_list={quote(arxiv_id)}"
+        try:
+            resp = await self._client.get(url)
+            if resp.status_code != 200:
+                return False, f"arXiv API error {resp.status_code}"
+            import xml.etree.ElementTree as ET
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+            root = ET.fromstring(resp.text)
+            entries = root.findall("atom:entry", ns)
+            if entries:
+                return True, f"arXiv ID {arxiv_id} valido"
+            return False, f"arXiv ID {arxiv_id} non trovato"
+        except Exception as e:
+            return False, f"arXiv ID error: {e}"
+
+    # ── L2: DOI resolution via Crossref ───────────────────────────
+    async def verify_doi(self, doi: str, expected_title: str) -> tuple[bool, str]:
+        """Risolve DOI via Crossref API e verifica il titolo."""
+        clean_doi = doi.strip().removeprefix("https://doi.org/").removeprefix("http://doi.org/").removeprefix("doi:").strip()
+        if not clean_doi:
+            return False, "DOI mancante"
+
+        url = f"{self.CROSSREF_URL}/{quote(clean_doi)}"
+        try:
+            resp = await self._client.get(url)
+            if resp.status_code != 200:
+                return False, f"Crossref error {resp.status_code}"
+
+            data = resp.json()
+            msg = data.get("message", {})
+            titles = msg.get("title", [])
+            if not titles:
+                return False, "Nessun titolo in Crossref"
+
+            import difflib
+            crossref_title = titles[0].strip().lower()
+            score = difflib.SequenceMatcher(
+                None, expected_title.lower(), crossref_title,
+            ).ratio()
+            if score > 0.6:
+                return True, f"DOI match (score={score:.2f})"
+            return False, f"Titolo Crossref non corrisponde (score={score:.2f})"
+        except Exception as e:
+            return False, f"DOI error: {e}"
+
+    # ── Two-level verification ────────────────────────────────────
+    async def verify_article(self, title: str, doi: str, arxiv_id: str = "") -> tuple[bool, str]:
+        """
+        Esegue L1 (arXiv) e L2 (DOI).
+        L1 usa arXiv ID se fornito, altrimenti cerca per titolo.
+        Un paper è verificato solo se SUPERA ENTRAMBI i livelli.
+        Se non ha DOI, il L2 fallisce automaticamente.
+        """
+        if arxiv_id:
+            l1_ok, l1_msg = await self.verify_arxiv_id(arxiv_id)
+        else:
+            l1_ok, l1_msg = await self.verify_arxiv(title)
+
+        has_doi = doi.lower().strip() not in ("", "doi not confirmed", "not available", "none", "n/a")
+        l2_ok, l2_msg = await self.verify_doi(doi, title) if has_doi else (False, "DOI non disponibile")
+
+        if l1_ok and l2_ok:
+            return True, f"L1 OK ({l1_msg}) · L2 OK ({l2_msg})"
+        return False, f"L1: {l1_msg} | L2: {l2_msg}"
+
+
+# ---------------------------------------------------------------------------
+# Pipeline per singolo sottotema: ResearchAgent → CitationVerifier → SummaryAgent
 # ---------------------------------------------------------------------------
 
 @dataclass
 class SubtopicResult:
     subtopic: str
+    target_journal: str
     articles_raw: str   # output grezzo del ResearchAgent
     summary_json: str   # JSON strutturato del SummaryAgent
 
@@ -352,29 +544,89 @@ def build_articles_corpus(results: list[SubtopicResult]) -> str:
     return "\n\n".join(parts)
 
 
-async def run_subtopic_pipeline(subtopic: str, num_articles: int = 3) -> SubtopicResult:
+async def run_subtopic_pipeline(
+    subtopic: str, target_journal: str = "", num_articles: int = 3,
+) -> SubtopicResult:
     """
-    Esegue in sequenza ResearchAgent e SummaryAgent per un singolo sottotema.
-    L'intera coppia viene lanciata in parallelo con le altre tramite asyncio.gather.
+    Esegue ResearchAgent → CitationVerifier (L1+L2, con retry) → SummaryAgent.
+    L'intera catena viene lanciata in parallelo con le altre tramite asyncio.gather.
     """
-    print(f"  🔍  [{subtopic[:55]}…] ricerca avviata")
+    print(f"  🔍  [{subtopic[:50]}…] ricerca su «{target_journal}»")
 
-    # ── ResearchAgent ────────────────────────────────────────────
-    researcher = ResearchAgent(num_articles=num_articles)
-    articles_raw = await researcher.a_run(
-        f"Find {num_articles} recent Q1 journal articles about: {subtopic}",
-    )
-    print(f"  ✓   [{subtopic[:55]}…] articoli trovati")
+    verifier = CitationVerifier()
+    try:
+        # ── ResearchAgent (con retry finché non abbiamo N articoli verificati) ──
+        verified_blocks: list[str] = []
+        used_titles: set[str] = set()
+        prompt_prefix = (
+            f"Research subtopic: {subtopic}\n"
+            f"Target journal: {target_journal}\n"
+        )
 
-    # ── SummaryAgent ─────────────────────────────────────────────
-    summarizer = SummaryAgent()
-    summary_json = await summarizer.a_run(
-        f"Analyse and summarise these articles:\n\n{articles_raw}",
-    )
-    print(f"  ✓   [{subtopic[:55]}…] analisi completata")
+        for attempt in range(5):
+            still_needed = num_articles - len(verified_blocks)
+            if still_needed <= 0:
+                break
+
+            if attempt == 0:
+                prompt = (
+                    f"{prompt_prefix}"
+                    f"Find {num_articles} articles published in {target_journal}."
+                )
+            else:
+                exclude = "; ".join(sorted(used_titles)[:10])
+                prompt = (
+                    f"{prompt_prefix}"
+                    f"Find {still_needed} DIFFERENT articles published in {target_journal}.\n"
+                    f"Do NOT repeat any of these already-found articles:\n{exclude}"
+                )
+
+            researcher = ResearchAgent(
+                num_articles=still_needed, target_journal=target_journal,
+            )
+            raw = await researcher.a_run(prompt)
+            articles = parse_articles(raw)
+
+            if not articles:
+                print(f"  ⚠️   [{subtopic[:50]}…] Researcher non ha prodotto articoli validi (tentativo {attempt+1})")
+                continue
+
+            for art in articles:
+                if art.title in used_titles:
+                    continue
+                ok, msg = await verifier.verify_article(art.title, art.doi, art.arxiv_id)
+                if ok:
+                    verified_blocks.append(art.raw)
+                    used_titles.add(art.title)
+                    print(f"  ✓   verificato: {art.title[:60]}…")
+                else:
+                    print(f"  ✗   non verificato: {art.title[:60]}… — {msg}")
+
+        if len(verified_blocks) < num_articles:
+            print(f"  ⚠️   [{subtopic[:50]}…] solo {len(verified_blocks)}/{num_articles} articoli verificati")
+
+        # ricostruisce il testo completo solo con gli articoli verificati
+        articles_raw = "\n\n".join(
+            f"### Article {i+1}\n{block}"
+            for i, block in enumerate(verified_blocks[:num_articles])
+        )
+        if not articles_raw:
+            articles_raw = "[No verified articles found]"
+
+        print(f"  ✓   [{subtopic[:50]}…] {len(verified_blocks)} articoli verificati")
+
+        # ── SummaryAgent ─────────────────────────────────────────
+        summarizer = SummaryAgent()
+        summary_json = await summarizer.a_run(
+            f"Analyse and summarise these articles:\n\n{articles_raw}",
+        )
+        print(f"  ✓   [{subtopic[:50]}…] analisi completata")
+    finally:
+        await verifier.close()
 
     return SubtopicResult(
         subtopic=subtopic,
+        target_journal=target_journal,
         articles_raw=articles_raw,
         summary_json=summary_json,
     )
@@ -386,16 +638,18 @@ async def run_subtopic_pipeline(subtopic: str, num_articles: int = 3) -> Subtopi
 
 async def run_pipeline(topic: str, num_subtopics: int = 3, num_articles: int = 3) -> PipelineResult:
     """
-    1. OrchestratorAgent  → scompone in num_subtopics sottotemi
-    2. [ResearchAgent + SummaryAgent] × N  → asyncio.gather (parallelo)
-    3. AggregatorAgent    → tabella Markdown
-    4. RelatedWorksDraftAgent → bozza narrativa con citazioni
-    5. NoveltyProposalAgent  → tabella novità con difficoltà
-    6. BibliographyAgent  → bibliografia IEEE formattata
+    1. OrchestratorAgent       → scompone in num_subtopics sottotemi
+    2. JournalAssignerAgent     → assegna un journal Q1 a ogni sottotema
+    3. [ResearchAgent → CitationVerifier(L1+L2, retry) → SummaryAgent] × N  → asyncio.gather
+    4. AggregatorAgent         → tabella Markdown
+    5. RelatedWorksDraftAgent  → bozza narrativa con citazioni
+    6. NoveltyProposalAgent    → tabella novità con difficoltà
+    7. BibliographyAgent       → bibliografia IEEE formattata
     """
     print(f"\n{'═' * 62}")
     print(f"  TOPIC: {topic}")
     print(f"  Sottotemi: {num_subtopics}")
+    print(f"  Articoli per sottotema: {num_articles}")
     print(f"{'═' * 62}\n")
 
     # ── Step 1: Orchestratore ────────────────────────────────────
@@ -417,10 +671,37 @@ async def run_pipeline(topic: str, num_subtopics: int = 3, num_articles: int = 3
 
     print(f"  Sottotemi:\n" + "\n".join(f"    {i+1}. {st}" for i, st in enumerate(subtopics)))
 
-    # ── Step 2: Coppie agenti in parallelo ───────────────────────
+    # ── Step 2: Journal Assigner ─────────────────────────────────
+    print("\n📌  JournalAssigner: assegnazione journal target…")
+    assigner = JournalAssignerAgent()
+    raw_journals = await assigner.a_run(
+        "Assign one different Q1 journal to each of these subtopics:\n"
+        + "\n".join(f"{i+1}. {st}" for i, st in enumerate(subtopics))
+    )
+
+    # parsa "N. subtopic → Journal Name"
+    journal_map: dict[str, str] = {}
+    for line in raw_journals.strip().splitlines():
+        m = re.match(r"\d+[\.\)]\s*(.*?)\s*→\s*(.*)", line.strip())
+        if m:
+            st = m.group(1).strip()
+            jn = m.group(2).strip()
+            journal_map[st] = jn
+
+    # fallback: assegna vuoto se il parse fallisce
+    target_journals = [journal_map.get(st, "") for st in subtopics]
+
+    for i, st in enumerate(subtopics):
+        j = target_journals[i]
+        print(f"    {i+1}. {st[:50]}… → {j or '(nessun journal assegnato)'}")
+
+    # ── Step 3: Coppie agenti in parallelo ───────────────────────
     print(f"\n🤖  Avvio di {len(subtopics)} coppie ResearchAgent+SummaryAgent in parallelo…\n")
     results: list[SubtopicResult] = await asyncio.gather(
-        *[run_subtopic_pipeline(st, num_articles=num_articles) for st in subtopics]
+        *[
+            run_subtopic_pipeline(st, target_journal=j, num_articles=num_articles)
+            for st, j in zip(subtopics, target_journals)
+        ]
     )
 
     # ── Step 3: Aggregatore ──────────────────────────────────────
@@ -539,6 +820,24 @@ async def main():
     print(f"\n💾  Risultati salvati in: {out_dir}/")
     for name in files:
         print(f"      {name}")
+
+    # ── Converti in PDF ──────────────────────────────────────────
+    try:
+        from markdown_pdf import MarkdownPdf, Section
+
+        pdf_path = out_dir / "results.pdf"
+        md_content = (out_dir / "results.md").read_text(encoding="utf-8")
+
+        pdf = MarkdownPdf(toc_level=2)
+        pdf.add_section(Section(md_content, paper_size="A4"))
+        pdf.save(str(pdf_path))
+
+        print(f"📄  PDF generato: {pdf_path}")
+    except ImportError:
+        print("⚠️  markdown-pdf non installato. Salta PDF.")
+        print("    Installa con: pip install markdown-pdf")
+    except Exception as e:
+        print(f"⚠️  Errore generazione PDF: {e}")
 
 
 if __name__ == "__main__":
