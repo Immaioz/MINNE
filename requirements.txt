@@ -1,0 +1,2 @@
+# Opzionale — per caricare .env automaticamente
+python-dotenv>=1.0.0

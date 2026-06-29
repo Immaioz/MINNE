@@ -1,0 +1,1 @@
+[1] W. Liang, Y. Zhang, Z. Wu, H. Lepp, W. Ji, X. Zhao, et al., "Quantifying large language model usage in scientific papers," *Nature Human Behaviour*, vol. 9, no. 12, pp. 2599–2609, 2025, doi: 10.1038/s41562-025-02273-8.

@@ -1,0 +1,4 @@
+.env.example
+.env
+opencode.json
+session
