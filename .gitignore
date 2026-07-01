@@ -2,5 +2,6 @@
 .env
 opencode.json
 session
-results/
+results
 quality
+__pycache__

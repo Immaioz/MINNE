@@ -1,23 +1,23 @@
 """
-Multi-Agent Scientific Research Pipeline (opencode)
-Usa opencode per orchestrare agenti ricercatori e analisti in parallelo.
+Multi-Agent Scientific Research Pipeline (DeepSeek direct API)
+Calls DeepSeek Chat API directly (no opencode subprocess).
 
-Flusso:
+Flow:
   OrchestratorAgent
     ├── ResearchAgent(topic_1) ──► CitationVerifier(L1+L2) ──► SummaryAgent(topic_1)
     ├── ResearchAgent(topic_2) ──► CitationVerifier(L1+L2) ──► SummaryAgent(topic_2)
     └── ResearchAgent(topic_N) ──► CitationVerifier(L1+L2) ──► SummaryAgent(topic_N)
-  AggregatorAgent  →  tabella Markdown
-  RelatedWorksDraftAgent  →  bozza narrativa con citazioni [N]
-  NoveltyProposalAgent  →  tabella novità con difficoltà
-  BibliographyAgent  →  bibliografia IEEE
+  AggregatorAgent  →  Markdown table
+  RelatedWorksDraftAgent  →  narrative draft with [N] citations
+  NoveltyProposalAgent  →  novelty table with difficulty ratings
+  BibliographyAgent  →  IEEE bibliography
 
-Verifica citazioni:
-  L1 — arXiv API: query per titolo, verifica esistenza paper
-  L2 — DOI resolution: risolve DOI via Crossref API, confronta titolo
-  Se un paper non supera entrambi i livelli, il ResearchAgent cerca un sostituto.
+Citation verification:
+  L1 — arXiv API: query by title, verify paper existence
+  L2 — DOI resolution: resolve DOI via Crossref API, compare title
+  If a paper fails both levels, ResearchAgent retries with a replacement.
 
-Ogni ResearchAgent cerca articoli su journal Q1 DIFFERENTI (nessun agente separato per assegnare journal).
+Each ResearchAgent finds articles from DIFFERENT Q1 journals (no separate JournalAssignerAgent).
 """
 
 import argparse
@@ -25,7 +25,6 @@ import asyncio
 import json
 import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,106 +44,113 @@ from literature.verify import (
     filter_verified_bibtex,
 )
 
-# Carica .env se presente (per OPENCODE_API_KEY e altre variabili)
+# Carica .env se presente
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent / ".env")
 except ImportError:
     pass
 
-# Usa la chiave API da .env invece della sessione opencode salvata
-_AUTH_PATH = Path.home() / ".local" / "share" / "opencode" / "auth.json"
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
-def _use_env_api_key():
-    """Sostituisce la chiave API in auth.json con quella da .env."""
-    env_key = os.environ.get("OPENCODE_API_KEY", "")
-    if not env_key:
-        return  # nessuna chiave da .env, usa quella salvata
-    try:
-        if _AUTH_PATH.exists():
-            auth = json.loads(_AUTH_PATH.read_text(encoding="utf-8"))
-            auth.setdefault("opencode", {})["key"] = env_key
-            _AUTH_PATH.write_text(json.dumps(auth, indent=2), encoding="utf-8")
-    except Exception:
-        pass  # se fallisce, continua con la chiave salvata
-
-_use_env_api_key()
+if not DEEPSEEK_API_KEY:
+    print(
+        "[Warning] DEEPSEEK_API_KEY non impostata. "
+        "Aggiungila al file .env:\n"
+        "  DEEPSEEK_API_KEY=sk-...\n"
+        "Oppure esportala come variabile d'ambiente.",
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------
-# LLM Client  —  chiamate API tramite `opencode run`
+# LLM Client  —  chiamate API dirette a DeepSeek
 # ---------------------------------------------------------------------------
 
-class OpencodeClient:
-    """Invia prompt a opencode via `opencode run --agent <name>`."""
+class DeepSeekClient:
+    """Calls DeepSeek Chat API directly via httpx."""
 
-    TIMEOUT = 300  # secondi
+    TIMEOUT = 300
 
     ERROR_PATTERNS = [
-        # (keyword list, user-friendly hint)
-        (["insufficient", "credit"], "Your API account has run out of credits/tokens. Top up at https://opencode.ai/auth"),
-        (["insufficient", "quota"], "Your API quota is exhausted. Check your plan at https://opencode.ai/auth"),
-        (["insufficient", "balance"], "Your API balance is too low. Add funds at https://opencode.ai/auth"),
-        (["insufficient", "fund"], "Your API account has insufficient funds. Add credits at https://opencode.ai/auth"),
-        (["payment", "required"], "Payment required. Your API account may be inactive or out of credits."),
-        (["billing"], "A billing issue with your API account. Check https://opencode.ai/auth"),
-        (["rate limit", "429"], "Rate-limited by the API. The pipeline will retry automatically on the next run."),
-        (["too many request"], "Too many requests. The pipeline will retry automatically on the next run."),
-        (["token limit"], "The prompt exceeds the model's maximum context length. Try reducing the number of articles per subtopic."),
-        (["maximum context"], "The prompt exceeds the model's maximum context length. Try reducing the number of articles per subtopic."),
-        (["context length"], "The combined prompt is too long for the model's context window. Reduce --articles or --subtopics."),
-        (["unauthorized", "key"], "Your API key is invalid or unauthorized. Check your OPENCODE_API_KEY in .env"),
-        (["invalid", "api key"], "Your API key is invalid. Check your OPENCODE_API_KEY in .env"),
-        (["authentication"], "Authentication failed. Verify your API key in .env or at https://opencode.ai/auth"),
-        (["server error", "500"], "The LLM provider returned a server error (500). This is usually temporary; retry the pipeline."),
-        (["server error", "503"], "The LLM provider is unavailable (503). This is usually temporary; retry the pipeline."),
-        (["502"], "The LLM provider returned a bad gateway (502). This is usually temporary; retry the pipeline."),
-        (["timeout", "504"], "The LLM provider timed out (504). This is usually temporary; retry the pipeline."),
-        (["deadline"], "The API request exceeded the deadline. Try again or reduce the prompt size."),
+        (["insufficient", "credit"], "Your DeepSeek account has run out of credits. Top up at https://platform.deepseek.com"),
+        (["insufficient", "quota"], "Your DeepSeek API quota is exhausted. Check your plan at https://platform.deepseek.com"),
+        (["insufficient", "balance"], "Your DeepSeek balance is too low. Add funds at https://platform.deepseek.com"),
+        (["payment", "required"], "Payment required. Your DeepSeek account may be inactive or out of credits."),
+        (["rate limit", "429"], "Rate-limited by DeepSeek API. Retry after a few seconds."),
+        (["too many request"], "Too many requests to DeepSeek API. Retry after a few seconds."),
+        (["token limit"], "The prompt exceeds DeepSeek's maximum context length. Try reducing the number of articles per subtopic."),
+        (["maximum context"], "The prompt exceeds DeepSeek's maximum context length. Try reducing the number of articles per subtopic."),
+        (["context length"], "The combined prompt is too long for DeepSeek's context window. Reduce --articles or --subtopics."),
+        (["unauthorized", "key"], "Your DeepSeek API key is invalid. Check DEEPSEEK_API_KEY in .env"),
+        (["invalid", "api key"], "Your DeepSeek API key is invalid. Check DEEPSEEK_API_KEY in .env"),
+        (["authentication"], "Authentication failed. Verify your DEEPSEEK_API_KEY in .env"),
+        (["server error", "500"], "DeepSeek API returned a server error (500). This is usually temporary; retry."),
+        (["server error", "503"], "DeepSeek API is unavailable (503). This is usually temporary; retry."),
+        (["502"], "DeepSeek API returned a bad gateway (502). This is usually temporary; retry."),
+        (["timeout", "504"], "DeepSeek API timed out (504). This is usually temporary; retry."),
     ]
 
-    def __init__(self, agent_name: str):
-        self.agent_name = agent_name
+    def __init__(self, system_prompt: str):
+        self.system_prompt = system_prompt
 
     async def ask(self, prompt: str) -> str:
-        return await asyncio.to_thread(self._ask_sync, prompt)
+        return await self._ask_async(prompt)
 
     @staticmethod
-    def _classify_error(stderr: str, stdout: str) -> str:
-        """Classify an opencode error into a user-friendly hint."""
-        combined = (stderr + " " + stdout).lower()
-        for keywords, hint in OpencodeClient.ERROR_PATTERNS:
+    def _classify_error(status_code: int, body: str) -> str:
+        combined = body.lower()
+        for keywords, hint in DeepSeekClient.ERROR_PATTERNS:
             if all(kw in combined for kw in keywords):
                 return hint
+        if status_code == 401:
+            return "Authentication failed. Verify your DEEPSEEK_API_KEY in .env"
+        if status_code == 429:
+            return "Rate-limited by DeepSeek API. Retry after a few seconds."
+        if status_code == 402:
+            return "Payment required. Your DeepSeek account may be out of credits."
+        if 500 <= status_code < 600:
+            return "DeepSeek API server error. This is usually temporary; retry."
         return ""
 
-    def _ask_sync(self, prompt: str) -> str:
+    async def _ask_async(self, prompt: str) -> str:
         safe = prompt.replace("\x00", "")
-        cmd = ["opencode", "run", "--agent", self.agent_name]
+        if not DEEPSEEK_API_KEY:
+            return "[Error] DEEPSEEK_API_KEY not set"
+        headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": DEEPSEEK_MODEL,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": safe},
+            ],
+        }
         try:
-            result = subprocess.run(
-                cmd,
-                input=safe,
-                capture_output=True,
-                text=True,
-                timeout=self.TIMEOUT,
-                cwd=Path(__file__).parent,
-            )
-            if result.returncode != 0:
-                err = result.stderr.strip() or result.stdout.strip()
-                hint = self._classify_error(result.stderr, result.stdout)
-                if hint:
-                    return f"[Error] opencode exit {result.returncode}: {err}\n\n💡 {hint}"
-                return f"[Error] opencode exit {result.returncode}: {err}"
-            return result.stdout.strip()
-        except FileNotFoundError:
-            return (
-                "[Error] opencode non trovato. Installalo con:\n"
-                "  curl -fsSL https://opencode.ai/install | bash\n"
-                "oppure:\n  npm install -g opencode-ai"
-            )
-        except subprocess.TimeoutExpired:
-            return f"[Error] opencode ha superato il timeout di {self.TIMEOUT}s"
+            async with httpx.AsyncClient(timeout=self.TIMEOUT) as client:
+                resp = await client.post(
+                    f"{DEEPSEEK_BASE_URL}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                if resp.status_code != 200:
+                    body = resp.text[:500]
+                    hint = self._classify_error(resp.status_code, body)
+                    msg = f"[Error] DeepSeek API returned {resp.status_code}: {body}"
+                    if hint:
+                        msg += f"\n\n💡 {hint}"
+                    return msg
+                data = resp.json()
+                choices = data.get("choices", [])
+                if not choices:
+                    return "[Error] DeepSeek API returned empty choices"
+                return choices[0].get("message", {}).get("content", "").strip()
+        except httpx.TimeoutException:
+            return f"[Error] DeepSeek API timeout ({self.TIMEOUT}s)"
         except Exception as e:
             return f"[Error] {e}"
 
@@ -154,15 +160,13 @@ class OpencodeClient:
 # ---------------------------------------------------------------------------
 
 class Agent:
-    """Minimal agent: delegates to opencode via `opencode run --agent <name>`."""
+    """Minimal agent: delegates to DeepSeek API directly."""
     name = ""
     system_prompt = ""
-    opencode_agent = ""
 
     async def a_run(self, prompt: str, **kwargs) -> str:
-        client = OpencodeClient(self.opencode_agent)
-        full = (self.system_prompt + "\n\n" + prompt) if self.system_prompt else prompt
-        return await client.ask(full)
+        client = DeepSeekClient(self.system_prompt)
+        return await client.ask(prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +188,6 @@ Example:
 class OrchestratorAgent(Agent):
     name = "OrchestratorAgent"
     system_prompt = ORCHESTRATOR_PROMPT
-    opencode_agent = "orchestrator"
 
 
 # ---------------------------------------------------------------------------
@@ -237,20 +240,15 @@ Format (repeat exactly for each article):
 class ResearchAgent(Agent):
     name = "ResearchAgent"
     system_prompt = RESEARCH_PROMPT
-    opencode_agent = "researcher"
 
     def __init__(self, num_articles: int = 3):
         self.num_articles = num_articles
 
     async def a_run(self, prompt: str, **kwargs) -> str:
-        client = OpencodeClient(self.opencode_agent)
-        full_prompt = (
-            self.system_prompt.format(num_articles=self.num_articles)
-            + "\n\n"
-            + prompt
-        )
-        # Remove null bytes to prevent subprocess errors
+        system = self.system_prompt.format(num_articles=self.num_articles)
+        full_prompt = system + "\n\n" + prompt
         full_prompt = full_prompt.replace("\x00", "")
+        client = DeepSeekClient(system)
         return await client.ask(full_prompt)
 
 
@@ -265,15 +263,10 @@ You are a concise academic analyst.
 You receive a structured list of scientific articles and must produce a JSON array
 with one object per article. No tools, no web search — only analyse the text you receive.
 
-Each JSON object MUST have exactly these six keys:
-  "title"       : string — full article title
-  "results"     : string — 1–2 sentences describing the KEY FINDINGS (max 30 words)
-  "journal"     : string — journal name and quartile, e.g. "Nature Machine Intelligence (Q1)"
-  "dataset"     : string — dataset(s) used, "none" if none, and whether it is public or private;
-                           if public include the download link/URL
-  "methodology" : string — brief description of the proposed method/approach (max 20 words)
-  "code"        : string — "not available" if no public code; otherwise the URL to the
-                           official code repository (GitHub, GitLab, etc.)
+Each JSON object MUST have exactly these three keys:
+  "title"   : string — full article title
+  "results" : string — 1–2 sentences describing the KEY FINDINGS (max 30 words)
+  "journal" : string — journal name and quartile, e.g. "Nature Machine Intelligence (Q1)"
 
 Reply with ONLY the raw JSON array — no markdown fences, no explanatory text.
 """
@@ -281,7 +274,6 @@ Reply with ONLY the raw JSON array — no markdown fences, no explanatory text.
 class SummaryAgent(Agent):
     name = "SummaryAgent"
     system_prompt = SUMMARY_PROMPT
-    opencode_agent = "summarizer"
 
 
 # ---------------------------------------------------------------------------
@@ -295,15 +287,12 @@ You are a scientific report writer.
 You receive multiple JSON arrays of article summaries, each prefixed with its subtopic.
 Produce a single clean Markdown table with these columns:
 
-| # | Title | Key Results | Journal | Methodology | Dataset | Code | Subtopic |
-|---|-------|-------------|---------|-------------|---------|------|----------|
+| # | Title | Key Results | Journal | Subtopic |
+|---|-------|-------------|---------|----------|
 
 Rules:
 - Include ALL articles from all subtopics.
 - Keep "Key Results" under 25 words per cell.
-- "Dataset" must state which dataset(s) were used and whether they are public or private;
-  if a public download link exists, include it as a Markdown link.
-- "Code" must contain a Markdown link to the official repository, or "Not available" if none.
 - Sort rows by Subtopic, then alphabetically by Title.
 - Reply with ONLY the Markdown table — no title, no preamble, no trailing text.
 """
@@ -311,7 +300,6 @@ Rules:
 class AggregatorAgent(Agent):
     name = "AggregatorAgent"
     system_prompt = AGGREGATOR_PROMPT
-    opencode_agent = "aggregator"
 
 
 # ---------------------------------------------------------------------------
@@ -345,7 +333,6 @@ Rules:
 class RelatedWorksDraftAgent(Agent):
     name = "RelatedWorksDraftAgent"
     system_prompt = RELATED_WORKS_PROMPT
-    opencode_agent = "related-works-draft"
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +359,6 @@ Rules:
 class BibliographyAgent(Agent):
     name = "BibliographyAgent"
     system_prompt = BIBLIOGRAPHY_PROMPT
-    opencode_agent = "bibliography"
 
 
 # ---------------------------------------------------------------------------
@@ -390,12 +376,13 @@ You receive:
    numbered citations [1], [2], ….
 2. The full numbered article corpus (title, authors, year, journal, abstract).
 
-First, produce a summary table of the identified novelties:
+Identify 3–5 concrete research directions / novelties that build on the gaps
+and challenges described in the draft. For each novelty produce:
 
 | # | Novelty | Description | Difficulty | Rationale |
 |---|---------|-------------|------------|-----------|
 
-Rules for the table:
+Rules:
 - "Difficulty" must be one of: ★ Easy, ★★ Medium, ★★★ Hard.
 - "Description" must clearly state WHAT would be done and WHY it is novel
   (2–3 sentences).
@@ -403,37 +390,13 @@ Rules for the table:
   why this fills a gap.
 - All novelties MUST be realistically implementable (no purely theoretical
   or data-unavailable proposals).
-
-Then, after the table, for EACH novelty provide a detailed discussion section
-with the following structure:
-
-### Novelty N: <title>
-
-**Methodology.** Outline the proposed approach step by step. Describe the
-architectural design, training procedure, and any key algorithmic innovations.
-
-**Dataset.** Specify which dataset(s) should be used, whether they are public
-or private, and include download links if public. If new data needs to be
-collected, describe the collection strategy.
-
-**Baselines & Comparisons.** List the state-of-the-art methods that should be
-used as baselines. Specify evaluation protocols (e.g. cross-validation, held-out
-test set) and the main metrics for comparison.
-
-**Evaluation Metrics.** List the quantitative and qualitative metrics to assess
-performance (e.g., accuracy, F1, throughput, latency, human evaluation, etc.).
-
-**Implementation Roadmap.** Summarise the key steps needed to implement this
-novelty, including any expected challenges and possible mitigation strategies.
-
-Do NOT invent article details beyond what the corpus provides. Use formal
-academic language throughout.
+- Reply with ONLY the Markdown table — no preamble, no commentary.
+- Do NOT invent article details beyond what the corpus provides.
 """
 
 class NoveltyProposalAgent(Agent):
     name = "NoveltyProposalAgent"
     system_prompt = NOVELTY_PROMPT
-    opencode_agent = "novelty-proposal"
 
 
 # ---------------------------------------------------------------------------
@@ -673,15 +636,13 @@ async def run_subtopic_pipeline(
     Esegue ResearchAgent → salva articoli proposti (.md) → CitationVerifier (DOI) → SummaryAgent.
     L'intera catena viene lanciata in parallelo con le altre tramite asyncio.gather.
     """
-    print(f"  🔍  [{subtopic[:50]}…] ricerca su journal Q1 multipli")
+    print(f"  🔍  [{subtopic[:50]}…] searching multiple Q1 journals")
 
-    # prepariamo cartella per gli articoli proposti
     proposed_dir = results_dir / "proposed"
     proposed_dir.mkdir(parents=True, exist_ok=True)
 
     verifier = CitationVerifier()
     try:
-        # ── ResearchAgent (con retry finché non abbiamo N articoli verificati) ──
         verified_blocks: list[str] = []
         used_titles: set[str] = set()
         prompt_prefix = f"Research subtopic: {subtopic}\n"
@@ -709,24 +670,23 @@ async def run_subtopic_pipeline(
             articles = parse_articles(raw)
 
             if not articles:
-                print(f"  ⚠️   [{subtopic[:50]}…] Researcher non ha prodotto articoli validi (tentativo {attempt+1})")
+                print(f"  ⚠️   [{subtopic[:50]}…] Researcher produced no valid articles (attempt {attempt+1})")
                 continue
 
-            # ── Salva articoli proposti su file .md (solo primo tentativo) ──
+            # Save proposed articles to .md (first attempt only)
             if attempt == 0:
                 subtopic_slug = re.sub(r"[^a-z0-9]+", "-", subtopic.lower()).strip("-")[:40]
                 proposed_path = proposed_dir / f"{subtopic_slug}.md"
-                header = f"# Articoli proposti: {subtopic}\n\n"
+                header = f"# Proposed articles: {subtopic}\n\n"
                 proposed_path.write_text(header + raw, encoding="utf-8")
-                print(f"  📄  articoli proposti salvati → {proposed_path}")
+                print(f"  📄  proposed articles saved → {proposed_path}")
 
             for art in articles:
                 if art.title in used_titles:
                     continue
                 ok, msg = await verifier.verify_article(art.title, art.doi, art.arxiv_id)
                 if ok:
-                    # ── arricchisci con testo completo del paper (PDF arXiv) ──
-                    print(f"  📥  download PDF: {art.title[:55]}…")
+                    print(f"  📥  downloading PDF: {art.title[:55]}…")
                     full_text = await verifier.fetch_full_text(art.arxiv_id)
                     if full_text:
                         word_count = len(full_text.split())
@@ -735,7 +695,7 @@ async def run_subtopic_pipeline(
                             f"- Full Text (from arXiv PDF, {word_count} words):\n"
                             f"{full_text}"
                         )
-                        print(f"  ✓   PDF estratto ({word_count} parole)")
+                        print(f"  ✓   PDF extracted ({word_count} words)")
                     else:
                         abs_text = await verifier.fetch_arxiv_abstract(art.arxiv_id)
                         if abs_text:
@@ -750,21 +710,20 @@ async def run_subtopic_pipeline(
                                 f"- arXiv: {art.arxiv_id}",
                                 enriched,
                             )
-                            print(f"  ⚠️   PDF non disponibile, usato abstract arXiv")
+                            print(f"  ⚠️   PDF unavailable, using arXiv abstract")
                         else:
                             enriched = art.raw
-                            print(f"  ⚠️   nessun testo alternativo disponibile")
+                            print(f"  ⚠️   no alternative text available")
 
                     verified_blocks.append(enriched)
                     used_titles.add(art.title)
-                    print(f"  ✓   verificato: {art.title[:55]}…")
+                    print(f"  ✓   verified: {art.title[:55]}…")
                 else:
-                    print(f"  ✗   non verificato: {art.title[:60]}… — {msg}")
+                    print(f"  ✗   not verified: {art.title[:60]}… — {msg}")
 
         if len(verified_blocks) < num_articles:
-            print(f"  ⚠️   [{subtopic[:50]}…] solo {len(verified_blocks)}/{num_articles} articoli verificati")
+            print(f"  ⚠️   [{subtopic[:50]}…] only {len(verified_blocks)}/{num_articles} articles verified")
 
-        # ricostruisce il testo completo solo con gli articoli verificati
         articles_raw = "\n\n".join(
             f"### Article {i+1}\n{block}"
             for i, block in enumerate(verified_blocks[:num_articles])
@@ -772,14 +731,14 @@ async def run_subtopic_pipeline(
         if not articles_raw:
             articles_raw = "[No verified articles found]"
 
-        print(f"  ✓   [{subtopic[:50]}…] {len(verified_blocks)} articoli verificati")
+        print(f"  ✓   [{subtopic[:50]}…] {len(verified_blocks)} articles verified")
 
         # ── SummaryAgent ─────────────────────────────────────────
         summarizer = SummaryAgent()
         summary_json = await summarizer.a_run(
             f"Analyse and summarise these articles:\n\n{articles_raw}",
         )
-        print(f"  ✓   [{subtopic[:50]}…] analisi completata")
+        print(f"  ✓   [{subtopic[:50]}…] analysis complete")
     finally:
         await verifier.close()
 
@@ -796,26 +755,26 @@ async def run_subtopic_pipeline(
 
 async def run_pipeline(topic: str, num_subtopics: int = 3, num_articles: int = 3) -> PipelineResult:
     """
-    1. OrchestratorAgent       → scompone in num_subtopics sottotemi
-    2. [ResearchAgent → proposte (.md) → CitationVerifier(DOI) → SummaryAgent] × N  → asyncio.gather
-    3. AggregatorAgent         → tabella Markdown
-    4. RelatedWorksDraftAgent  → bozza narrativa con citazioni
-    5. NoveltyProposalAgent    → tabella novità con difficoltà
-    6. BibliographyAgent       → bibliografia IEEE formattata
+    1. OrchestratorAgent       → decompose into num_subtopics subtopics
+    2. [ResearchAgent → proposals (.md) → CitationVerifier(DOI) → SummaryAgent] × N  → asyncio.gather
+    3. AggregatorAgent         → Markdown table
+    4. RelatedWorksDraftAgent  → narrative draft with citations
+    5. NoveltyProposalAgent    → novelty table with difficulty
+    6. BibliographyAgent       → formatted IEEE bibliography
     """
     print(f"\n{'═' * 62}")
     print(f"  TOPIC: {topic}")
-    print(f"  Sottotemi: {num_subtopics}")
-    print(f"  Articoli per sottotema: {num_articles}")
+    print(f"  Subtopics: {num_subtopics}")
+    print(f"  Articles per subtopic: {num_articles}")
     print(f"{'═' * 62}\n")
 
-    # cartella risultati globale
+    # global results directory
     topic_slug = _topic_slug(topic)
     results_dir = Path(__file__).parent / "results" / topic_slug
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Step 1: Orchestratore ────────────────────────────────────
-    print("📋  Orchestratore: scomposizione del topic…")
+    # ── Step 1: Orchestrator ─────────────────────────────────────
+    print("📋  Orchestrator: topic decomposition…")
     orchestrator = OrchestratorAgent()
     raw_subtopics = await orchestrator.a_run(
         f"Decompose into exactly {num_subtopics} subtopics: {topic}",
@@ -831,10 +790,10 @@ async def run_pipeline(topic: str, num_subtopics: int = 3, num_articles: int = 3
     if not subtopics:
         subtopics = [l.strip() for l in raw_subtopics.splitlines() if l.strip()][:num_subtopics]
 
-    print(f"  Sottotemi:\n" + "\n".join(f"    {i+1}. {st}" for i, st in enumerate(subtopics)))
+    print(f"  Subtopics:\n" + "\n".join(f"    {i+1}. {st}" for i, st in enumerate(subtopics)))
 
-    # ── Step 2: Coppie agenti in parallelo ───────────────────────
-    print(f"\n🤖  Avvio di {len(subtopics)} coppie ResearchAgent+SummaryAgent in parallelo…\n")
+    # ── Step 2: Parallel agent pairs ─────────────────────────────
+    print(f"\n🤖  Launching {len(subtopics)} ResearchAgent+SummaryAgent pairs in parallel…\n")
     results: list[SubtopicResult] = await asyncio.gather(
         *[
             run_subtopic_pipeline(st, results_dir, num_articles=num_articles)
@@ -842,8 +801,8 @@ async def run_pipeline(topic: str, num_subtopics: int = 3, num_articles: int = 3
         ]
     )
 
-    # ── Step 3: Aggregatore ──────────────────────────────────────
-    print("\n📊  Aggregatore: composizione tabella finale…")
+    # ── Step 3: Aggregator ───────────────────────────────────────
+    print("\n📊  Aggregator: building final table…")
     combined_input = "\n\n".join(
         f"=== Subtopic: {r.subtopic} ===\n{r.summary_json}"
         for r in results
@@ -852,7 +811,7 @@ async def run_pipeline(topic: str, num_subtopics: int = 3, num_articles: int = 3
     table = await aggregator.a_run(combined_input)
 
     # ── Step 4: Related Works Draft ──────────────────────────────
-    print("\n✍️   RelatedWorksDraftAgent: scrittura bozza narrativa…")
+    print("\n✍️   RelatedWorksDraftAgent: writing narrative draft…")
     corpus = build_articles_corpus(results)
     draft_input = (
         f"=== ARTICLES CORPUS ===\n{corpus}\n\n"
@@ -862,7 +821,7 @@ async def run_pipeline(topic: str, num_subtopics: int = 3, num_articles: int = 3
     draft = await draft_agent.a_run(draft_input)
 
     # ── Step 5: Novelty Proposal ─────────────────────────────────
-    print("\n💡  NoveltyProposalAgent: proposta novità…")
+    print("\n💡  NoveltyProposalAgent: proposing novelties…")
     novelty_input = (
         f"=== RELATED WORK DRAFT ===\n{draft}\n\n"
         f"=== ARTICLES CORPUS ===\n{corpus}"
@@ -871,7 +830,7 @@ async def run_pipeline(topic: str, num_subtopics: int = 3, num_articles: int = 3
     novelties = await novelty_agent.a_run(novelty_input)
 
     # ── Step 6: Bibliography ─────────────────────────────────────
-    print("📚  BibliographyAgent: formattazione bibliografia…")
+    print("📚  BibliographyAgent: formatting bibliography…")
     bib_input = (
         f"=== DRAFT ===\n{draft}\n\n"
         f"=== ARTICLES CORPUS ===\n{corpus}"
@@ -897,12 +856,16 @@ async def run_pipeline(topic: str, num_subtopics: int = 3, num_articles: int = 3
     kb_parts.append(f"## Bibliography\n\n{bibliography}\n")
     knowledge_base = "\n".join(kb_parts)
 
-    print("✅  Pipeline completata.\n")
+    print("✅  Pipeline complete.\n")
     return PipelineResult(
         table=table, draft=draft, novelties=novelties, bibliography=bibliography,
         knowledge_base=knowledge_base, subtopic_results=results,
     )
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # PDF generation with wide-table handling
@@ -917,7 +880,6 @@ def _table_to_list(md_table: str) -> str:
     if not lines:
         return md_table
 
-    # Find header row and delimiter row
     header_idx = None
     delim_idx = None
     for i, line in enumerate(lines):
@@ -930,36 +892,31 @@ def _table_to_list(md_table: str) -> str:
                 break
 
     if header_idx is None or delim_idx is None:
-        return md_table  # not a parseable table
+        return md_table
 
-    # Extract column headers
     headers = [h.strip() for h in lines[header_idx].strip().strip("|").split("|")]
     num_cols = len(headers)
 
     if num_cols <= 5:
-        return md_table  # narrow enough, keep as-is
+        return md_table
 
-    # Parse data rows (skip header, delimiter, optional separator lines)
     out_parts: list[str] = []
     for line in lines[delim_idx + 1:]:
         stripped = line.strip()
         if not stripped or not stripped.startswith("|"):
             continue
         cells = [c.strip() for c in stripped.strip("|").split("|")]
-        # Align cell count with headers
         while len(cells) < num_cols:
             cells.append("")
         cells = cells[:num_cols]
 
-        # Skip empty rows
         if all(c == "" or c == "..." for c in cells):
             continue
 
-        # Build bullet list for this row
         item_parts: list[str] = []
         for h, c in zip(headers, cells):
             if h in ("#", ""):
-                continue  # skip index column
+                continue
             if c and c != "...":
                 item_parts.append(f"  - **{h}:** {c}")
         if item_parts:
@@ -982,20 +939,17 @@ def _fix_wide_tables(markdown_text: str, max_cols: int = 5) -> str:
 
     for line in markdown_text.splitlines(keepends=True):
         stripped = line.strip()
-        # Detect start of a table
         if stripped.startswith("|") and stripped.endswith("|"):
             table_lines.append(line)
             in_table = True
         else:
             if in_table:
-                # End of table — process it
                 table_text = "".join(table_lines)
                 result.append(_table_to_list(table_text))
                 table_lines = []
                 in_table = False
             result.append(line)
 
-    # Handle table at end of file
     if in_table and table_lines:
         table_text = "".join(table_lines)
         result.append(_table_to_list(table_text))
@@ -1027,7 +981,6 @@ def _find_public_datasets(table_md: str) -> list[tuple[int, str, str]]:
     if not lines:
         return []
 
-    # Find header and delimiter
     header_idx = None
     delim_idx = None
     for i, line in enumerate(lines):
@@ -1045,7 +998,6 @@ def _find_public_datasets(table_md: str) -> list[tuple[int, str, str]]:
 
     headers = [h.strip().lower() for h in lines[header_idx].strip().strip("|").split("|")]
 
-    # Find dataset column index
     ds_col = None
     for i, h in enumerate(headers):
         if h == "dataset":
@@ -1061,11 +1013,9 @@ def _find_public_datasets(table_md: str) -> list[tuple[int, str, str]]:
             continue
         cell = cells[ds_col]
         cell_lower = cell.lower()
-        # Check if marked public but has no URL (no http://, https://, or [link](...) pattern)
         has_url = "http://" in cell or "https://" in cell or "[link]" in cell.lower() or "](http" in cell
         is_public = "public" in cell_lower
         if is_public and not has_url and "none" not in cell_lower:
-            # Extract dataset name from the cell
             name = cell.split("(")[0].split(",")[0].strip()
             if name and name.lower() not in ("public", "dataset", "yes", "n/a", ""):
                 needs_link.append((row_idx, name, cell))
@@ -1077,7 +1027,6 @@ def _update_dataset_cell(table_md: str, row_idx: int, new_cell: str) -> str:
     lines = table_md.splitlines()
     line = lines[row_idx]
     cells = line.strip().strip("|").split("|")
-    # Find dataset column index
     header_idx = None
     delim_idx = None
     for i, l in enumerate(lines):
@@ -1104,10 +1053,10 @@ def _update_dataset_cell(table_md: str, row_idx: int, new_cell: str) -> str:
     return "\n".join(lines)
 
 
-async def _enrich_dataset_links(table_md: str) -> str:
+async def _enrich_dataset_links_deepseek(table_md: str) -> str:
     """
     Search the web for public dataset names missing download links
-    and update the table accordingly.
+    and update the table accordingly (uses DeepSeek API directly).
     """
     needs = _find_public_datasets(table_md)
     if not needs:
@@ -1116,14 +1065,11 @@ async def _enrich_dataset_links(table_md: str) -> str:
     print(f"  🔍  ricerca link per {len(needs)} dataset pubblici...")
     result = table_md
     for row_idx, ds_name, _old_cell in needs:
-        client = OpencodeClient("researcher")  # use researcher agent for web search
-        search_prompt = f"{DATASET_SEARCH_PROMPT}\n\nDataset name: {ds_name}"
-        url = await client.ask(search_prompt)
+        client = DeepSeekClient(DATASET_SEARCH_PROMPT)
+        url = await client.ask(f"Dataset name: {ds_name}")
         url = url.strip()
         if url and url != "NOT FOUND" and not url.startswith("[Error"):
-            # Remove trailing punctuation
             url = url.rstrip(".,;")
-            # Check if it's a valid-looking URL
             if url.startswith("http://") or url.startswith("https://"):
                 old = _old_cell
                 new = f"{old} ([link]({url}))"
@@ -1136,6 +1082,7 @@ async def _enrich_dataset_links(table_md: str) -> str:
 
     return result
 
+
 def _topic_slug(topic: str) -> str:
     """Converte un topic in una stringa usabile come nome di cartella."""
     slug = topic.lower().strip()
@@ -1145,7 +1092,7 @@ def _topic_slug(topic: str) -> str:
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Scientific Research Pipeline — multi-agent literature survey",
+        description="Scientific Research Pipeline (DeepSeek API) — multi-agent literature survey",
     )
     parser.add_argument("topic", type=str,
                         help="Research topic (e.g. 'Deep learning for medical imaging')")
@@ -1160,30 +1107,30 @@ async def main():
     )
 
     # ── Enrich public dataset links via web search ──────────────
-    table = await _enrich_dataset_links(result.table)
+    table = await _enrich_dataset_links_deepseek(result.table)
     # Also update knowledge_base with enriched table
     knowledge_base = result.knowledge_base
     knowledge_base = knowledge_base.replace(result.table, table)
 
     sep = "─" * 62
     print(sep)
-    print("RISULTATI FINALI")
+    print("FINAL RESULTS")
     print(sep)
 
-    print("\n📊  TABELLA AGGREGATA\n")
+    print("\n📊  AGGREGATED TABLE\n")
     print(table)
 
-    print("\n✍️  BOZZA RELATED WORKS\n")
+    print("\n✍️  RELATED WORKS DRAFT\n")
     print(result.draft)
 
-    print("\n💡  NOVITÀ PROPOSTE\n")
+    print("\n💡  PROPOSED NOVELTIES\n")
     print(result.novelties)
 
-    print("\n📚  BIBLIOGRAFIA\n")
+    print("\n📚  BIBLIOGRAPHY\n")
     print(result.bibliography)
     print(sep)
 
-    # ── Save to file ────────────────────────────────────────────
+    # ── Save to file ───────────────────────────────────────────
     out_dir = Path(__file__).parent / "results" / _topic_slug(args.topic)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1198,18 +1145,18 @@ async def main():
         (out_dir / name).write_text(content.strip() + "\n", encoding="utf-8")
 
     # Combined
-    combined_md = (
+    combined = out_dir / "results.md"
+    combined.write_text(
         f"# Scientific Research Results\n\n"
         f"**Topic:** {args.topic}\n\n"
         f"## Aggregated Table\n\n{table}\n\n"
         f"## Related Work\n\n{result.draft}\n\n"
         f"## Proposed Novelties\n\n{result.novelties}\n\n"
-        f"## References\n\n{result.bibliography}\n"
+        f"## References\n\n{result.bibliography}\n",
+        encoding="utf-8",
     )
-    combined = out_dir / "results.md"
-    combined.write_text(combined_md, encoding="utf-8")
 
-    print(f"\n💾  Risultati salvati in: {out_dir}/")
+    print(f"\n💾  Results saved to: {out_dir}/")
     for name in files:
         print(f"      {name}")
 
@@ -1218,7 +1165,7 @@ async def main():
         from markdown_pdf import MarkdownPdf, Section
 
         pdf_path = out_dir / "results.pdf"
-        pdf_md = _fix_wide_tables(combined_md, max_cols=5)
+        pdf_md = _fix_wide_tables(combined.read_text(encoding="utf-8"), max_cols=5)
 
         pdf = MarkdownPdf(toc_level=2)
         pdf.add_section(Section(pdf_md, paper_size="A4"))

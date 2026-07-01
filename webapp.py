@@ -3,9 +3,12 @@ Webapp per lanciare la pipeline e visualizzare risultati in markdown.
 """
 
 import json
+import os
 import subprocess
 import sys
 import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -211,6 +214,210 @@ def raw_file(slug, filename):
 @app.route("/api/results")
 def api_results():
     return flask.jsonify(list_results())
+
+
+# ---------------------------------------------------------------------------
+# Chat — agente conversazionale basato su knowledge_base.md
+# ---------------------------------------------------------------------------
+
+CHAT_SYSTEM_PROMPT = """\
+You are a research assistant helping a scientist explore a collection of
+scientific articles and novelty proposals.
+
+You have access to a knowledge base (attached file) containing all the
+articles, summaries, related work, novelty proposals, and bibliography
+for a specific research topic.
+
+Guidelines:
+- Answer questions based ONLY on the information in the knowledge base.
+- If the answer is not in the knowledge base, say so politely.
+- When discussing an article, mention its authors and year.
+- When discussing a novelty, refer to its difficulty and rationale.
+- Keep answers concise but informative.
+- Use markdown formatting for readability when appropriate.
+"""
+
+
+def _load_chat_history(slug: str) -> list[dict]:
+    """Load the current chat history for a topic."""
+    history_file = RESULTS_DIR / slug / "chats" / "current.json"
+    if history_file.is_file():
+        try:
+            return json.loads(history_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def _save_chat_history(slug: str, history: list[dict]) -> None:
+    """Save the current chat history."""
+    chat_dir = RESULTS_DIR / slug / "chats"
+    chat_dir.mkdir(parents=True, exist_ok=True)
+    (chat_dir / "current.json").write_text(
+        json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8",
+    )
+
+
+def _save_chat_report(slug: str, history: list[dict]) -> str:
+    """Save a chat report and return the filename."""
+    chat_dir = RESULTS_DIR / slug / "chats"
+    chat_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build markdown report
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    parts = [f"# Chat Report — {slug}\n"]
+    parts.append(f"**Date:** {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+    parts.append("---\n\n")
+    for msg in history:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        if role == "user":
+            parts.append(f"**You:**\n\n{content}\n\n")
+        elif role == "assistant":
+            parts.append(f"**Assistant:**\n\n{content}\n\n")
+    report_name = f"chat_{timestamp}.md"
+    report_path = chat_dir / report_name
+    report_path.write_text("".join(parts), encoding="utf-8")
+    return report_name
+
+
+def _get_knowledge_base_path(slug: str) -> Path | None:
+    """Return the path to the knowledge base file if it exists."""
+    kb = RESULTS_DIR / slug / "knowledge_base.md"
+    return kb if kb.is_file() else None
+
+
+@app.route("/chat/<slug>")
+def chat_page(slug):
+    kb_path = _get_knowledge_base_path(slug)
+    if not kb_path:
+        flask.flash(f"Nessuna knowledge base trovata per «{slug}». Esegui prima la pipeline.")
+        return flask.redirect(f"/result/{slug}")
+
+    # Load topic from results
+    md_file = RESULTS_DIR / slug / "results.md"
+    topic = slug
+    if md_file.is_file():
+        for line in md_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("**Topic:**"):
+                topic = line.replace("**Topic:**", "").strip()
+                break
+
+    # Load history
+    history = _load_chat_history(slug)
+
+    return flask.render_template(
+        "chat.html", slug=slug, topic=topic,
+        history=history,
+        chat_files=sorted(
+            p.name for p in (RESULTS_DIR / slug / "chats").iterdir()
+            if p.suffix == ".md"
+        ) if (RESULTS_DIR / slug / "chats").is_dir() else [],
+    )
+
+
+@app.route("/chat/<slug>/ask", methods=["POST"])
+def chat_ask(slug):
+    kb_path = _get_knowledge_base_path(slug)
+    if not kb_path:
+        return {"error": "Knowledge base not found"}, 404
+
+    data = flask.request.get_json(silent=True)
+    if not data or "message" not in data:
+        return {"error": "Missing message"}, 400
+
+    user_message = data["message"].strip()
+    if not user_message:
+        return {"error": "Empty message"}, 400
+
+    # Load history
+    history = _load_chat_history(slug)
+
+    # Append user message
+    history.append({"role": "user", "content": user_message, "timestamp": time.time()})
+
+    # Build context from history (keep last N messages)
+    context_messages = history[-20:]  # last 20 messages for context
+
+    # Build the prompt for opencode
+    conversation = ""
+    for msg in context_messages[:-1]:  # exclude the last user message (it's the current one)
+        role = "User" if msg["role"] == "user" else "Assistant"
+        conversation += f"\n\n**{role}:** {msg['content']}"
+
+    prompt = (
+        f"{CHAT_SYSTEM_PROMPT}\n\n"
+        f"---\n\n"
+        f"Conversation so far:{conversation}\n\n"
+        f"**User:** {user_message}\n\n"
+        f"**Assistant:**"
+    )
+
+    # Call opencode with the knowledge base as context
+    try:
+        cmd = [
+            "opencode", "run", "--agent", "researcher",
+            "--file", str(kb_path),
+        ]
+        result = subprocess.run(
+            cmd, input=prompt, capture_output=True, text=True, timeout=300,
+            cwd=BASE_DIR,
+        )
+        if result.returncode != 0:
+            reply = f"[Error] opencode exit {result.returncode}: {result.stderr.strip() or result.stdout.strip()}"
+        else:
+            reply = result.stdout.strip()
+    except FileNotFoundError:
+        reply = "[Error] opencode not found. Install it first."
+    except subprocess.TimeoutExpired:
+        reply = "[Error] opencode timed out (300s)."
+    except Exception as e:
+        reply = f"[Error] {e}"
+
+    # Append assistant reply
+    history.append({"role": "assistant", "content": reply, "timestamp": time.time()})
+    _save_chat_history(slug, history)
+
+    return {"reply": reply, "history_length": len(history)}
+
+
+def _append_chat_to_knowledge_base(kb_path: Path, slug: str, history: list[dict]) -> None:
+    """Append a chat session's Q&A to the knowledge base so future sessions
+    can benefit from the enriched context."""
+    parts = ["\n\n"]
+    parts.append("---\n\n")
+    parts.append(f"## Chat Knowledge — {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n")
+    for msg in history:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        if role == "user":
+            parts.append(f"### User Question\n\n{content}\n\n")
+        elif role == "assistant":
+            parts.append(f"### Assistant Answer\n\n{content}\n\n")
+    parts.append("\n")
+    with open(kb_path, "a", encoding="utf-8") as f:
+        f.write("".join(parts))
+
+
+@app.route("/chat/<slug>/save", methods=["POST"])
+def chat_save(slug):
+    kb_path = _get_knowledge_base_path(slug)
+    if not kb_path:
+        return {"error": "Knowledge base not found"}, 404
+
+    history = _load_chat_history(slug)
+    if not history:
+        return {"error": "No chat history to save"}, 400
+
+    report_name = _save_chat_report(slug, history)
+
+    # Enrich knowledge base with this chat session
+    _append_chat_to_knowledge_base(kb_path, slug, history)
+
+    # Clear current history
+    _save_chat_history(slug, [])
+
+    return {"report": report_name, "message": "Chat saved and knowledge base enriched."}
 
 
 # ---------------------------------------------------------------------------
