@@ -19,6 +19,7 @@ app = flask.Flask(__name__)
 app.secret_key = "research-pipeline-webapp-secret"
 
 running_jobs: dict[str, dict] = {}
+LOG_DIR = Path("/tmp/opencode/pipeline-logs")
 
 
 # ---------------------------------------------------------------------------
@@ -102,27 +103,43 @@ def run():
     if slug in running_jobs:
         return flask.render_template("loading.html", slug=slug, topic=topic)
 
-    # launch pipeline in background
+    # launch pipeline in background with streaming log
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_file = LOG_DIR / f"{slug}.log"
+    status_file = LOG_DIR / f"{slug}.status"
+
+    status_file.write_text("running", encoding="utf-8")
+
     def _run():
         running_jobs[slug] = {"status": "running", "topic": topic}
+        cmd = [
+            sys.executable, "-u", str(BASE_DIR / "pipeline.py"), topic,
+            "--subtopics", str(subtopics), "--articles", str(articles),
+        ]
         try:
-            proc = subprocess.run(
-                [sys.executable, str(BASE_DIR / "pipeline.py"), topic,
-                 "--subtopics", str(subtopics), "--articles", str(articles)],
-                capture_output=True, text=True, timeout=1800,
-                cwd=BASE_DIR,
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, cwd=BASE_DIR,
             )
-            running_jobs[slug] = {
-                "status": "done" if proc.returncode == 0 else "error",
-                "topic": topic,
-                "stdout": proc.stdout,
-                "stderr": proc.stderr,
-            }
+            with log_file.open("w", encoding="utf-8") as f:
+                for line in proc.stdout:
+                    f.write(line)
+                    f.flush()
+            proc.wait(timeout=1800)
+            final = "done" if proc.returncode == 0 else "error"
+            status_file.write_text(final, encoding="utf-8")
+            running_jobs[slug] = {"status": final, "topic": topic}
         except subprocess.TimeoutExpired:
-            running_jobs[slug] = {"status": "error", "topic": topic,
-                                   "stderr": "Timeout (1800s)"}
+            proc.kill()
+            with log_file.open("a", encoding="utf-8") as f:
+                f.write("\n[TIMEOUT] Pipeline interrotta dopo 1800s\n")
+            status_file.write_text("error", encoding="utf-8")
+            running_jobs[slug] = {"status": "error", "topic": topic}
         except Exception as e:
-            running_jobs[slug] = {"status": "error", "topic": topic, "stderr": str(e)}
+            with log_file.open("a", encoding="utf-8") as f:
+                f.write(f"\n[ERROR] {e}\n")
+            status_file.write_text("error", encoding="utf-8")
+            running_jobs[slug] = {"status": "error", "topic": topic}
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -133,12 +150,33 @@ def run():
 @app.route("/check/<slug>")
 def check(slug):
     job = running_jobs.get(slug)
-    if job is None:
-        # check if completed already (from previous server session)
-        if (RESULTS_DIR / slug / "results.md").is_file():
-            return {"status": "done"}
-        return {"status": "not_found"}
-    return {"status": job["status"]}
+    if job is not None:
+        return {"status": job["status"]}
+
+    # fallback: file-based status (persiste tra restart del server)
+    status_file = LOG_DIR / f"{slug}.status"
+    if status_file.is_file():
+        st = status_file.read_text(encoding="utf-8").strip()
+        return {"status": st}
+
+    if (RESULTS_DIR / slug / "results.md").is_file():
+        return {"status": "done"}
+    return {"status": "not_found"}
+
+
+@app.route("/output/<slug>")
+def output(slug):
+    log_file = LOG_DIR / f"{slug}.log"
+    if not log_file.is_file():
+        return flask.Response("", mimetype="text/plain")
+
+    try:
+        # returns last 80 lines
+        lines = log_file.read_text(encoding="utf-8").splitlines()
+        tail = lines[-80:] if len(lines) > 80 else lines
+        return flask.Response("\n".join(tail), mimetype="text/plain")
+    except Exception:
+        return flask.Response("", mimetype="text/plain")
 
 
 @app.route("/result/<slug>")
@@ -180,5 +218,7 @@ def api_results():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"\n  🌐  Research Pipeline Webapp — http://127.0.0.1:5050\n")
-    app.run(host="127.0.0.1", port=5050, debug=True)
+    import sys
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5050
+    print(f"\n  🌐  Research Pipeline Webapp — http://127.0.0.1:{port}\n")
+    app.run(host="127.0.0.1", port=port, debug=False)
