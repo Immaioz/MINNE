@@ -21,5 +21,6 @@ Rules:
 - Include ONLY articles that are actually cited in the draft.
 - Preserve the citation numbers from the draft.
 - Use the real DOI where available; otherwise write "doi: not available".
+- Sort by citation number (ascending).
 - All entries must be real — do not invent details.
 - Reply with ONLY the reference list — no preamble, no commentary.

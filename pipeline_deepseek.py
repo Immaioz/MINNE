@@ -263,10 +263,15 @@ You are a concise academic analyst.
 You receive a structured list of scientific articles and must produce a JSON array
 with one object per article. No tools, no web search — only analyse the text you receive.
 
-Each JSON object MUST have exactly these three keys:
-  "title"   : string — full article title
-  "results" : string — 1–2 sentences describing the KEY FINDINGS (max 30 words)
-  "journal" : string — journal name and quartile, e.g. "Nature Machine Intelligence (Q1)"
+Each JSON object MUST have exactly these six keys:
+  "title"       : string — full article title
+  "results"     : string — 1–2 sentences describing the KEY FINDINGS (max 30 words)
+  "journal"     : string — journal name and quartile, e.g. "Nature Machine Intelligence (Q1)"
+  "dataset"     : string — dataset(s) used, "none" if none, and whether it is public or private;
+                           if public include the download link/URL
+  "methodology" : string — brief description of the proposed method/approach (max 20 words)
+  "code"        : string — "not available" if no public code; otherwise the URL to the
+                           official code repository (GitHub, GitLab, etc.)
 
 Reply with ONLY the raw JSON array — no markdown fences, no explanatory text.
 """
@@ -287,12 +292,15 @@ You are a scientific report writer.
 You receive multiple JSON arrays of article summaries, each prefixed with its subtopic.
 Produce a single clean Markdown table with these columns:
 
-| # | Title | Key Results | Journal | Subtopic |
-|---|-------|-------------|---------|----------|
+| # | Title | Key Results | Journal | Methodology | Dataset | Code | Subtopic |
+|---|-------|-------------|---------|-------------|---------|------|----------|
 
 Rules:
 - Include ALL articles from all subtopics.
 - Keep "Key Results" under 25 words per cell.
+- "Dataset" must state which dataset(s) were used and whether they are public or private;
+  if a public download link exists, include it as a Markdown link.
+- "Code" must contain a Markdown link to the official repository, or "Not available" if none.
 - Sort rows by Subtopic, then alphabetically by Title.
 - Reply with ONLY the Markdown table — no title, no preamble, no trailing text.
 """
@@ -376,13 +384,12 @@ You receive:
    numbered citations [1], [2], ….
 2. The full numbered article corpus (title, authors, year, journal, abstract).
 
-Identify 3–5 concrete research directions / novelties that build on the gaps
-and challenges described in the draft. For each novelty produce:
+First, produce a summary table of the identified novelties:
 
 | # | Novelty | Description | Difficulty | Rationale |
 |---|---------|-------------|------------|-----------|
 
-Rules:
+Rules for the table:
 - "Difficulty" must be one of: ★ Easy, ★★ Medium, ★★★ Hard.
 - "Description" must clearly state WHAT would be done and WHY it is novel
   (2–3 sentences).
@@ -390,8 +397,31 @@ Rules:
   why this fills a gap.
 - All novelties MUST be realistically implementable (no purely theoretical
   or data-unavailable proposals).
-- Reply with ONLY the Markdown table — no preamble, no commentary.
-- Do NOT invent article details beyond what the corpus provides.
+
+Then, after the table, for EACH novelty provide a detailed discussion section
+with the following structure:
+
+### Novelty N: <title>
+
+**Methodology.** Outline the proposed approach step by step. Describe the
+architectural design, training procedure, and any key algorithmic innovations.
+
+**Dataset.** Specify which dataset(s) should be used, whether they are public
+or private, and include download links if public. If new data needs to be
+collected, describe the collection strategy.
+
+**Baselines & Comparisons.** List the state-of-the-art methods that should be
+used as baselines. Specify evaluation protocols (e.g. cross-validation, held-out
+test set) and the main metrics for comparison.
+
+**Evaluation Metrics.** List the quantitative and qualitative metrics to assess
+performance (e.g., accuracy, F1, throughput, latency, human evaluation, etc.).
+
+**Implementation Roadmap.** Summarise the key steps needed to implement this
+novelty, including any expected challenges and possible mitigation strategies.
+
+Do NOT invent article details beyond what the corpus provides. Use formal
+academic language throughout.
 """
 
 class NoveltyProposalAgent(Agent):

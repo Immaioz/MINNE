@@ -53,14 +53,36 @@ def list_results() -> list[dict]:
         md_file = d / "results.md"
         if md_file.is_file():
             topic = ""
-            for line in md_file.read_text(encoding="utf-8").splitlines():
+            preview = ""
+            md_text = md_file.read_text(encoding="utf-8")
+            for line in md_text.splitlines():
                 if line.startswith("**Topic:**"):
                     topic = line.replace("**Topic:**", "").strip()
-                    break
+                elif not topic and line.startswith("#"):
+                    topic = line.lstrip("#").strip()
+            # Build preview: first meaningful content lines after the topic header
+            lines = md_text.splitlines()
+            found = False
+            preview_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if not found:
+                    if stripped.startswith("##") and "Aggregated" not in stripped:
+                        found = True
+                    continue
+                if stripped and not stripped.startswith("|") and not stripped.startswith("---"):
+                    preview_lines.append(stripped)
+                    if len(preview_lines) >= 2:
+                        break
+            preview = " ".join(preview_lines)[:200]
+            if len(preview) >= 200:
+                preview += "…"
+
             entries.append({
                 "slug": d.name,
                 "topic": topic or d.name,
                 "mtime": d.stat().st_mtime,
+                "preview": preview or "(no content)",
                 "files": [f.name for f in d.iterdir() if f.suffix in (".md", ".pdf")],
             })
     return entries

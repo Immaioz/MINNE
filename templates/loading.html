@@ -4,65 +4,142 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>In esecuzione — {{ topic }}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="/static/style.css" rel="stylesheet">
   <style>
-    body { padding-top: 2rem; background: #0f0f1a; }
-    h2 { color: #a8a8ff; }
-    .log-box {
-      background: #0a0a14;
-      border: 1px solid #2a2a4a;
-      border-radius: 8px;
-      padding: 1rem;
-      font-family: "Cascadia Code", "Fira Code", "JetBrains Mono", monospace;
-      font-size: 0.8rem;
-      line-height: 1.5;
-      color: #b0b0d0;
-      max-height: 70vh;
-      overflow-y: auto;
-      white-space: pre-wrap;
-      word-break: break-all;
-      text-align: left;
+    .pipeline-progress {
+      display: flex;
+      justify-content: space-between;
+      position: relative;
+      margin: 2rem 0 3rem;
     }
-    .log-box .highlight { color: #6c5ce7; font-weight: bold; }
-    .log-box .success { color: #00d68f; }
-    .log-box .error { color: #ff6b6b; }
-    .log-box .info { color: #5dade2; }
-    .badge-status {
-      display: inline-block;
-      padding: 0.25rem 0.75rem;
-      border-radius: 20px;
-      font-size: 0.85rem;
-      background: #2a2a4a;
-      color: #a8a8ff;
+    .pipeline-progress::before {
+      content: '';
+      position: absolute;
+      top: 14px; left: 0; right: 0;
+      height: 3px;
+      background: var(--border);
+      z-index: 0;
     }
-    .badge-status.running { background: #6c5ce722; color: #6c5ce7; }
-    .badge-status.done { background: #00d68f22; color: #00d68f; }
-    .badge-status.error { background: #ff6b6b22; color: #ff6b6b; }
+    .pipeline-progress .pp-step {
+      position: relative;
+      z-index: 1;
+      text-align: center;
+      flex: 1;
+    }
+    .pipeline-progress .pp-dot {
+      width: 30px; height: 30px;
+      border-radius: 50%;
+      background: var(--border);
+      border: 2px solid var(--bg-deep);
+      margin: 0 auto 0.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      transition: var(--transition);
+    }
+    .pipeline-progress .pp-step.done .pp-dot {
+      background: var(--success);
+      color: #fff;
+    }
+    .pipeline-progress .pp-step.active .pp-dot {
+      background: var(--accent);
+      color: #fff;
+      box-shadow: 0 0 12px var(--accent-glow);
+    }
+    .pipeline-progress .pp-label {
+      font-size: 0.7rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+    .pipeline-progress .pp-step.active .pp-label {
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .pipeline-progress .pp-step.done .pp-label {
+      color: var(--success);
+    }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="d-flex justify-content-between align-items-center mb-3">
-      <h2 style="font-size: 1.4rem;">&#x2697; Pipeline in esecuzione</h2>
-      <span id="statusBadge" class="badge-status running">⏳ In esecuzione</span>
-    </div>
-    <p class="text-secondary mb-3" style="font-size: 0.95rem;">{{ topic }}</p>
 
-    <div id="logBox" class="log-box mb-3">
-      Avvio della pipeline in corso…
+  <nav class="navbar navbar-custom">
+    <div class="container">
+      <a class="navbar-brand" href="/">&#x2697; MINNE</a>
+      <span class="badge-status running pulse">&#9203; In esecuzione</span>
     </div>
+  </nav>
 
-    <p class="text-secondary small text-center">
-      <span id="lineCount">0</span> righe · aggiornamento ogni 2s
-    </p>
+  <div class="container py-4">
+
+    <div class="card-custom fade-in">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span>&#9654; Pipeline in esecuzione</span>
+        <small class="text-secondary" style="font-size:0.8rem;" id="elapsed">00:00</small>
+      </div>
+      <div class="card-body">
+
+        <p class="text-secondary mb-3" style="font-size:0.9rem;">{{ topic }}</p>
+
+        <div class="pipeline-progress" id="phaseProgress">
+          <div class="pp-step" data-phase="1">
+            <div class="pp-dot">1</div>
+            <div class="pp-label">Orchestrator</div>
+          </div>
+          <div class="pp-step" data-phase="2">
+            <div class="pp-dot">2</div>
+            <div class="pp-label">Research</div>
+          </div>
+          <div class="pp-step" data-phase="3">
+            <div class="pp-dot">3</div>
+            <div class="pp-label">Aggregator</div>
+          </div>
+          <div class="pp-step" data-phase="4">
+            <div class="pp-dot">4</div>
+            <div class="pp-label">Draft + Novelties</div>
+          </div>
+          <div class="pp-step" data-phase="5">
+            <div class="pp-dot">5</div>
+            <div class="pp-label">Export</div>
+          </div>
+        </div>
+
+        <div id="logBox" class="log-box mb-3">
+          <span class="log-info">&#9654; Avvio della pipeline…</span>
+        </div>
+
+        <div class="d-flex justify-content-between align-items-center">
+          <div>
+            <small class="text-muted"><span id="lineCount">0</span> righe</small>
+            <small class="text-muted ms-2">&middot; aggiornamento ogni 2s</small>
+          </div>
+          <a href="/" class="btn-ghost btn-sm">&#8592; Torna alla home</a>
+        </div>
+
+      </div>
+    </div>
   </div>
 
   <script>
     const slug = "{{ slug }}";
     const logBox = document.getElementById('logBox');
-    const statusBadge = document.getElementById('statusBadge');
     const lineCount = document.getElementById('lineCount');
     let autoScroll = true;
+    const startTime = Date.now();
+    const elapsed = document.getElementById('elapsed');
+
+    const PHASE_PATTERNS = [
+      { patterns: [/(orchestrat|decompos)/i], phase: 1 },
+      { patterns: [/(research|searching|subtopic|arxiv|doi|verif|pdf)/i], phase: 2 },
+      { patterns: [/(aggregat|tabella|table|final)/i], phase: 3 },
+      { patterns: [/(draft|related.works|novelty|novit|bibliograph)/i], phase: 4 },
+      { patterns: [/(pdf|export|saved|salvati|results)/i], phase: 5 },
+    ];
+    let currentPhase = 0;
 
     logBox.addEventListener('scroll', () => {
       const atBottom = logBox.scrollHeight - logBox.scrollTop - logBox.clientHeight < 40;
@@ -77,37 +154,57 @@
 
     function highlight(text) {
       return text
-        .replace(/(✓|✅)/g, '<span class="success">$1</span>')
-        .replace(/(✗|⚠️)/g, '<span class="error">$1</span>')
-        .replace(/(📋|📌|🤖|📊|✍️|💡|📚|📥|💾)/g, '<span class="info">$1</span>')
-        .replace(/(VERIFIED|OK|done|completata)/gi, '<span class="success">$1</span>')
-        .replace(/(error|fail|not|non|mancante|fallito)/gi, '<span class="error">$1</span>');
+        .replace(/(✓|✅)/g, '<span class="log-success">$1</span>')
+        .replace(/(✗|⚠️)/g, '<span class="log-error">$1</span>')
+        .replace(/(error|fail|mancante|fallito)/gi, '<span class="log-error">$1</span>')
+        .replace(/(Avvio|completata|done|saved|salvati)/gi, '<span class="log-success">$1</span>');
+    }
+
+    function updatePhase(text) {
+      for (const entry of PHASE_PATTERNS) {
+        if (entry.patterns.some(p => p.test(text)) && entry.phase > currentPhase) {
+          currentPhase = entry.phase;
+          const steps = document.querySelectorAll('.pp-step');
+          steps.forEach((step, i) => {
+            const num = parseInt(step.dataset.phase);
+            step.classList.toggle('done', num < currentPhase);
+            step.classList.toggle('active', num === currentPhase);
+          });
+          break;
+        }
+      }
+    }
+
+    function updateElapsed() {
+      const sec = Math.floor((Date.now() - startTime) / 1000);
+      const m = String(Math.floor(sec / 60)).padStart(2, '0');
+      const s = String(sec % 60).padStart(2, '0');
+      elapsed.textContent = m + ':' + s;
     }
 
     function pollOutput() {
-      fetch(`/output/${slug}`).then(r => r.text()).then(text => {
+      fetch('/output/' + slug).then(r => r.text()).then(text => {
         if (text) {
           const lines = text.split('\n');
           lineCount.textContent = lines.length;
-          logBox.innerHTML = highlight(escapeHtml(text));
-          if (autoScroll) {
-            logBox.scrollTop = logBox.scrollHeight;
-          }
+          const html = highlight(escapeHtml(text));
+          logBox.innerHTML = html;
+          if (autoScroll) logBox.scrollTop = logBox.scrollHeight;
+          updatePhase(text);
         }
       }).catch(() => {});
     }
 
     function pollStatus() {
-      fetch(`/check/${slug}`).then(r => r.json()).then(data => {
+      fetch('/check/' + slug).then(r => r.json()).then(data => {
         if (data.status === 'done') {
-          statusBadge.className = 'badge-status done';
-          statusBadge.textContent = '✅ Completato';
-          // one last output fetch then redirect
+          document.querySelector('.badge-status').className = 'badge-status done';
+          document.querySelector('.badge-status').textContent = '✅ Completato';
           setTimeout(() => { pollOutput(); }, 500);
-          setTimeout(() => { window.location.href = `/result/${slug}`; }, 2000);
+          setTimeout(() => { window.location.href = '/result/' + slug; }, 2500);
         } else if (data.status === 'error') {
-          statusBadge.className = 'badge-status error';
-          statusBadge.textContent = '❌ Errore';
+          document.querySelector('.badge-status').className = 'badge-status error';
+          document.querySelector('.badge-status').textContent = '❌ Errore';
           setTimeout(() => { pollOutput(); }, 500);
           setTimeout(() => { window.location.href = '/'; }, 5000);
         } else if (data.status === 'running') {
@@ -118,8 +215,8 @@
       }).catch(() => { setTimeout(pollStatus, 3000); });
     }
 
-    // poll output every 2s, status every 2s
     setInterval(pollOutput, 2000);
+    setInterval(updateElapsed, 1000);
     setTimeout(pollStatus, 2000);
     setTimeout(pollOutput, 500);
   </script>
