@@ -4,5 +4,5 @@ opencode.json
 session
 results
 quality
-__pycache__
+__pycache__/
 pipeline_deepseek.py
