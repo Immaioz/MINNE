@@ -7,55 +7,96 @@ Orchestrates AI agents via `opencode` (or DeepSeek API directly) to search, veri
 ## Architecture
 
 ```
-OrchestratorAgent (opencode run --agent orchestrator)
-    └── asyncio.gather (parallel)
-          ├── ResearchAgent(topic_1)
-          │     └── literature.search_papers()       # OpenAlex + Semantic Scholar + arXiv
-          │     └── CitationVerifier (L1: arXiv DOI, L2: Crossref title match)
-          │     └── PDF download + text extraction
-          │     └── SummaryAgent(topic_1)
-          ├── ResearchAgent(topic_2)
-          │     └── ...
-          └── ResearchAgent(topic_N)
-                └── ...
-  AggregatorAgent        → Markdown table
-  RelatedWorksDraftAgent → narrative draft with [N] citations
-  NoveltyProposalAgent   → novelty table with difficulty (★–★★★)
-  BibliographyAgent      → IEEE-formatted bibliography
-  KnowledgeBaseGen       → chatbot-ready knowledge_base.md
+                    ┌──────────────────────┐
+                    │  OrchestratorAgent    │
+                    └──────────┬───────────┘
+                               │
+                    asyncio.gather (parallel)
+                    ┌─────┬─────┬─────┬─────┐
+                    │     │     │     │     │
+               ┌────┘ ┌───┘ ┌───┘ ┌───┘ ┌───┘
+               │     │     │     │     │
+     ┌─────────▼──┐  │  ┌──▼──────────┐  │
+     │ResearchAgent│  │  │ResearchAgent│  │
+     │ (LLM/web)   │  │  │ (LLM/web)   │  │
+     └──────┬─────┘  │  └──────┬───────┘  │
+            │        │         │          │
+     ┌──────▼──────┐ │  ┌──────▼────────┐ │
+     │CitationVerif│ │  │CitationVerif  │ │
+     │(arXiv+DOI)  │ │  │(arXiv+DOI)    │ │
+     └──────┬──────┘ │  └──────┬────────┘ │
+            │        │         │          │
+     ┌──────▼──────┐ │  ┌──────▼────────┐ │
+     │SummaryAgent │ │  │SummaryAgent   │ │
+     └─────────────┘ │  └───────────────┘ │
+               │     │     │     │     │
+               └─────┴─────┴─────┴─────┘
+                         │
+              ┌──────────▼──────────┐
+              │   AggregatorAgent   │ → Markdown table
+              └──────────┬──────────┘
+                         │
+              ┌──────────▼──────────────┐
+              │ RelatedWorksDraftAgent  │ → narrative draft
+              └──────────┬──────────────┘
+                         │
+              ┌──────────▼──────────┐
+              │ NoveltyProposalAgent│ → novelty table
+              └──────────┬──────────┘
+                         │
+              ┌──────────▼──────────┐
+              │  BibliographyAgent  │ → IEEE refs
+              └─────────────────────┘
 ```
 
-Each agent runs as an `opencode` subprocess (or a direct DeepSeek API call in `pipeline_deepseek.py`). The prompt is passed via **stdin** (not CLI arguments) to avoid Linux `ARG_MAX` limits on large contexts (~20+ papers).
+### Module structure
+
+| File | Purpose |
+|------|---------|
+| `pipeline.py` | Main entry (opencode subprocess), orchestration + CLI |
+| `pipeline_deepseek.py` | Alternative entry using direct DeepSeek API |
+| `pipeline_agents.py` | `OpencodeClient`, all 7 agent classes + prompts (opencode variant) |
+| `pipeline_deepseek_agents.py` | `DeepSeekClient`, all 7 agent classes + prompts (DeepSeek variant) |
+| `pipeline_domain.py` | Shared domain models: `Author`, `Paper`, `Article`, `PipelineResult`, parsers |
+| `pipeline_search.py` | Unified search: OpenAlex + Semantic Scholar + arXiv, deduplication, BibTeX generation |
+| `pipeline_verifier.py` | Citation verification: arXiv API, Crossref DOI (with DataCite fallback), result types, caching |
+| `pipeline_cache.py` | File-based query cache for search results (TTL per source) |
+| `pipeline_markdown.py` | Markdown table utilities, wide-table handling, dataset link enrichment |
+| `webapp.py` | Flask web interface for launching pipelines and browsing results |
 
 ### Agents
 
 | Agent | Role |
 |-------|------|
 | `OrchestratorAgent` | Decomposes the topic into N distinct subtopics |
-| `ResearchAgent` | Finds N recent Q1 articles per subtopic (different journals) via OpenAlex + S2 + arXiv |
-| `CitationVerifier` | Two-level verification: L1 — arXiv API metadata, L2 — Crossref DOI/title match |
+| `ResearchAgent` | Finds N recent Q1 articles per subtopic (different journals) via web search |
+| `CitationVerifier` | Two-level verification: arXiv API metadata + Crossref DOI/title match (with DataCite fallback) |
 | `SummaryAgent` | Structures validated papers into JSON (title, results, journal, methodology, dataset, code) |
 | `AggregatorAgent` | Merges all JSON arrays into a Markdown table (with Methodology, Dataset, Code columns) |
 | `RelatedWorksDraftAgent` | Writes a narrative state-of-the-art with inline [N] citations |
 | `NoveltyProposalAgent` | Proposes 4–5 feasible novelties with difficulty ratings and detailed discussion per novelty |
 | `BibliographyAgent` | Formats references in IEEE style |
 
-### Literature search sources (fallback chain)
+### Literature search sources
 
-1. **OpenAlex** — primary Q1 journal search, filtered by type, year, and citation count
-2. **Semantic Scholar** — fallback if OpenAlex is unavailable (rate-limited, retries up to 3×)
-3. **arXiv** — final fallback via direct API + `arxiv` Python library
+The `pipeline_search.py` module provides programmatic search across three academic APIs, used for citation verification and optional paper discovery:
 
-All requests use polite pool with `mailto` (OpenAlex) and exponential backoff.
+1. **OpenAlex** — primary search backend (10K requests/day with polite pool), indexes arXiv, PubMed, CrossRef
+2. **Semantic Scholar** — fallback, provides citation counts and author metadata
+3. **arXiv** — final fallback via direct API
+
+Requests are cached locally in `~/.cache/datapizza/search/` with per-source TTL (24h arXiv, 3d S2/OpenAlex).
 
 ### Citation verification
 
-Each paper undergoes two independent checks before acceptance:
+Each paper undergoes verification via `pipeline_verifier.py`:
 
-- **L1 (arXiv)** — resolves the arXiv ID or queries by title; paper must exist
-- **L2 (Crossref)** — resolves the DOI, compares returned title with expected title (fuzzy match via `difflib`)
+- **L1 (arXiv)** — resolves the arXiv ID or queries by title with Jaccard word-overlap matching
+- **L2 (Crossref)** — resolves the DOI, compares returned title with expected title
+- **DataCite fallback** — for arXiv DOIs (10.48550/) not indexed by Crossref
+- **Caching** — results cached in `~/.cache/datapizza/verify/` to avoid re-verifying known papers
 
-Both levels must pass, otherwise the ResearchAgent retries with a replacement (up to 5 attempts).
+Verification returns structured `CitationResult` objects with status: `VERIFIED`, `SUSPICIOUS`, `HALLUCINATED`, or `SKIPPED`.
 
 ---
 
@@ -91,7 +132,7 @@ Arguments:
 - `--subtopics` — number of parallel subtopics (default: 3)
 - `--articles` — articles per subtopic (default: 3)
 
-Uses `opencode run --agent <name>` for each agent step.
+Uses `opencode run --agent <name>` for each agent step (agents defined in `pipeline_agents.py`).
 
 ### Pipeline CLI (DeepSeek direct)
 
@@ -99,21 +140,29 @@ Uses `opencode run --agent <name>` for each agent step.
 python pipeline_deepseek.py "Research topic" --subtopics 3 --articles 3
 ```
 
-Identical interface but calls the DeepSeek Chat API directly (no opencode dependency). Useful if you already have a DeepSeek API key and want to avoid the opencode subscription.
+Identical interface but calls the DeepSeek Chat API directly (no opencode dependency). Useful if you already have a DeepSeek API key and want to avoid the opencode subscription. Agents defined in `pipeline_deepseek_agents.py`.
 
 ### Webapp
 
 ```bash
-python webapp.py
-# → http://127.0.0.1:5050
+python webapp.py [port]
+# default: http://127.0.0.1:5050
 ```
 
 Browser interface for:
 - Launching the pipeline via form (topic, subtopics, articles)
-- Real-time execution status
+- Real-time execution status with live log streaming
 - Browsing past results (rendered Markdown → HTML)
 - Downloading raw files (Markdown, PDF)
 - **Chat interface** — interactive Q&A with an AI agent on any completed result, powered by the generated knowledge base
+
+
+<p align="center">
+  <img src="static/screenshots/webapp_chat.png" alt="Webapp chat interface" width="700">
+</p>
+
+<!-- ![Webapp home page](static/screenshots/webapp_home.png) -->
+
 
 ---
 
@@ -128,6 +177,10 @@ Each completed pipeline run generates a `knowledge_base.md` that powers an **int
 3. The agent answers **only** based on the knowledge base content (no external search)
 4. Chat history is kept in `current.json` during the session
 
+<p align="center">
+  <img src="static/screenshots/webapp_chat.png" alt="Webapp chat interface" width="700">
+</p>
+
 ### Save & Enrich
 
 When you close a chat session via the **Save & Close** button:
@@ -139,7 +192,9 @@ Saved chat reports are listed on the chat page for later review.
 
 ---
 
-## Output
+## Results
+
+After running a pipeline, the output is saved to `results/<topic-slug>/`:
 
 ```
 results/<topic-slug>/
@@ -154,13 +209,22 @@ results/<topic-slug>/
 └── chats/                 # saved chat reports (one .md per session)
 ```
 
-Intermediate files per subtopic are saved under `results/<topic-slug>/proposed/`.
+<p align="center">
+  <img src="static/screenshots/webapp_result.png" alt="Webapp results page" width="700">
+</p>
 
 ---
 
 ## Agent definitions
 
-System prompts for each agent live in `.opencode/agents/*.md`. These are invoked by `opencode run --agent <name>` and are the single source of truth for agent behavior. Editing an agent file changes its behavior across the pipeline.
+Each pipeline variant defines agents in a dedicated Python module, including system prompts and API client logic:
+
+| File | Pipeline | Client |
+|------|----------|--------|
+| `pipeline_agents.py` | `pipeline.py` (default) | `OpencodeClient` → `opencode run --agent <name>` |
+| `pipeline_deepseek_agents.py` | `pipeline_deepseek.py` | `DeepSeekClient` → direct DeepSeek Chat API |
+
+The opencode agents are also defined as `.opencode/agents/*.md` files, which serve as the single source of truth when using `opencode run`:
 
 | File | Agent |
 |------|-------|
@@ -176,12 +240,15 @@ System prompts for each agent live in `.opencode/agents/*.md`. These are invoked
 
 ## Technical notes
 
-- Each agent runs as an `opencode` subprocess (`opencode run --agent <name>`) with the prompt piped via **stdin** to avoid command-line length limits.
-- `pipeline_deepseek.py` uses direct DeepSeek API calls instead of opencode subprocesses, but follows the same workflow.
+- Shared domain models and utilities live in `pipeline_domain.py`, `pipeline_verifier.py`, `pipeline_search.py`, and `pipeline_markdown.py` — both pipeline variants import from these modules.
+- `pipeline.py` runs agents via `opencode run --agent <name>` (opencode subprocess), while `pipeline_deepseek.py` calls the DeepSeek Chat API directly.
 - The API key is read from `.env` (`OPENCODE_API_KEY`) and written into `~/.local/share/opencode/auth.json` at startup, overriding any previously saved session credentials.
+- `pipeline_search.py` provides programmatic search across OpenAlex, Semantic Scholar, and arXiv with deduplication and local caching.
+- `pipeline_verifier.py` uses Jaccard word-overlap title similarity (`title_similarity`) instead of `difflib.SequenceMatcher` for more robust matching.
+- Verification supports three statuses: `VERIFIED` (sim ≥ 0.80), `SUSPICIOUS` (0.50 ≤ sim < 0.80), `HALLUCINATED` (sim < 0.50 or not found).
 - Parallelism for ResearchAgent → CitationVerifier → SummaryAgent pairs is managed via `asyncio.gather`.
 - If no papers pass verification for a subtopic, the pipeline retries with rejection feedback (up to 5 attempts).
-- PDF download is attempted via the Unpaywall DOI proxy (`doi.org`) and full-text is extracted with `PyMuPDF` (fitz); if unavailable, a fallback sentence is used.
+- PDF download is attempted via arXiv and full-text is extracted with `PyMuPDF` (fitz); if unavailable, the arXiv abstract is used as fallback.
 - **Aggregated table** includes columns for **Methodology**, **Dataset** (with download links for public datasets), and **Code** (with repository links when available).
 - **Dataset link enrichment:** After the aggregated table is built, the pipeline automatically detects public datasets missing download URLs and uses web search to find and insert them.
 - **PDF wide-table handling:** If the aggregated table has more than 5 columns, it is automatically converted to a per-row bullet list before PDF generation to ensure all columns are readable.
@@ -190,3 +257,5 @@ System prompts for each agent live in `.opencode/agents/*.md`. These are invoked
 - **Novelty proposals** include a summary table plus a detailed discussion section per novelty: methodology, dataset(s) with links, baselines & comparisons, evaluation metrics, and an implementation roadmap with expected challenges and mitigation strategies.
 - PDF output requires `markdown-pdf` (optional; skipped if not installed).
 - All agents in `.opencode/agents/*.md` use `mode: all`.
+- Search results are cached in `~/.cache/datapizza/search/` (TTL per source: 24h arXiv, 3d S2/OpenAlex).
+- Verification results are cached in `~/.cache/datapizza/verify/` (TTL: ~1 year, since verified papers don't change).
