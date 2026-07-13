@@ -31,7 +31,7 @@ _DEFAULT_SOURCES = ("openalex", "semantic_scholar", "arxiv")
 # ---------------------------------------------------------------------------
 
 _OPENALEX_URL = "https://api.openalex.org/works"
-_OPENALEX_EMAIL = "research@datapizza.ai"
+_OPENALEX_EMAIL = "research@minne.local"
 
 
 async def _search_openalex(

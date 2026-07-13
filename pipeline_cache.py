@@ -15,7 +15,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_CACHE_DIR = Path.home() / ".cache" / "datapizza" / "search"
+_CACHE_DIR = Path(__file__).resolve().parent / "results" / ".cache" / "search"
 _TTL_SEC = 86400 * 7
 
 _SOURCE_TTL: dict[str, float] = {

@@ -85,7 +85,7 @@ The `pipeline_search.py` module provides programmatic search across three academ
 2. **Semantic Scholar** — fallback, provides citation counts and author metadata
 3. **arXiv** — final fallback via direct API
 
-Requests are cached locally in `~/.cache/datapizza/search/` with per-source TTL (24h arXiv, 3d S2/OpenAlex).
+Requests are cached locally in `results/.cache/search/` with per-source TTL (24h arXiv, 3d S2/OpenAlex).
 
 ### Citation verification
 
@@ -94,7 +94,7 @@ Each paper undergoes verification via `pipeline_verifier.py`:
 - **L1 (arXiv)** — resolves the arXiv ID or queries by title with Jaccard word-overlap matching
 - **L2 (Crossref)** — resolves the DOI, compares returned title with expected title
 - **DataCite fallback** — for arXiv DOIs (10.48550/) not indexed by Crossref
-- **Caching** — results cached in `~/.cache/datapizza/verify/` to avoid re-verifying known papers
+- **Caching** — results cached in `results/.cache/verify/` to avoid re-verifying known papers
 
 Verification returns structured `CitationResult` objects with status: `VERIFIED`, `SUSPICIOUS`, `HALLUCINATED`, or `SKIPPED`.
 
@@ -257,5 +257,5 @@ The opencode agents are also defined as `.opencode/agents/*.md` files, which ser
 - **Novelty proposals** include a summary table plus a detailed discussion section per novelty: methodology, dataset(s) with links, baselines & comparisons, evaluation metrics, and an implementation roadmap with expected challenges and mitigation strategies.
 - PDF output requires `markdown-pdf` (optional; skipped if not installed).
 - All agents in `.opencode/agents/*.md` use `mode: all`.
-- Search results are cached in `~/.cache/datapizza/search/` (TTL per source: 24h arXiv, 3d S2/OpenAlex).
-- Verification results are cached in `~/.cache/datapizza/verify/` (TTL: ~1 year, since verified papers don't change).
+- Search results are cached in `results/.cache/search/` (TTL per source: 24h arXiv, 3d S2/OpenAlex).
+- Verification results are cached in `results/.cache/verify/` (TTL: ~1 year, since verified papers don't change).
