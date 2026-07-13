@@ -327,7 +327,7 @@ def _encode_params(params: dict[str, str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Deduplication  (from literature/search.py)
+# Deduplication
 # ---------------------------------------------------------------------------
 
 

@@ -32,18 +32,6 @@ from urllib.parse import quote
 
 import httpx
 
-# Unified literature search & verification system
-from literature.arxiv_client import search_arxiv
-from literature.models import Author, Paper
-from literature.search import search_papers
-from literature.verify import (
-    CitationResult,
-    VerificationReport,
-    VerifyStatus,
-    verify_citations,
-    filter_verified_bibtex,
-)
-
 # Carica .env se presente
 try:
     from dotenv import load_dotenv

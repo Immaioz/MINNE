@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 
 
 # ---------------------------------------------------------------------------
-# Literature domain models  (from literature/models.py)
+# Literature domain models
 # ---------------------------------------------------------------------------
 
 
